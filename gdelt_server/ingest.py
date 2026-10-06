@@ -38,6 +38,7 @@ class Ingestor:
         self.phase = "idle"
         self.current_file = None
         self.on_update = None
+        self.last_prune = 0.
 
     def cleanup_abandoned(self):
         # Called only after the service's exclusive instance lock is acquired.
@@ -71,11 +72,11 @@ class Ingestor:
         end = min(horizon, start + DAY)
         return self.store.enqueue(start, end, cursor=end)
 
-    def backfill(self, hours):
+    def backfill(self, hours, start_ts=None):
         if hours < 1 or hours > self.settings.day_retention_days * 24:
             raise ValueError("回填范围必须在1小时至日保留期之间")
         horizon = int(utcnow().timestamp()) // SLOT * SLOT
-        return self.store.enqueue(horizon-hours*3600, horizon)
+        return self.store.enqueue(start_ts if start_ts is not None else horizon-hours*3600, horizon)
 
     def process(self, kind, ts):
         self.check_disk()
@@ -114,7 +115,10 @@ class Ingestor:
             if clear_cancel:
                 self.cancel.clear()
             self.phase = "scheduling"
-            self.store.prune(self.settings.hour_retention_days, self.settings.day_retention_days)
+            import time
+            if time.monotonic()-self.last_prune >= 3600:
+                self.store.prune(self.settings.hour_retention_days, self.settings.day_retention_days)
+                self.last_prune = time.monotonic()
             if schedule:
                 self.schedule()
             self.check_disk()
@@ -133,7 +137,6 @@ class Ingestor:
                     failed += 1
                     self.store.mark_failed(kind, ts, exc)
                     LOG.warning("批次失败 %s %s: %s", kind, ts, exc)
-            self.store.prune(self.settings.hour_retention_days, self.settings.day_retention_days)
             if done:
                 self.store.set_state("last_ingest_at", utcnow().isoformat())
                 self.store.set_state("snapshot_dirty", True)

@@ -21,6 +21,7 @@ def main():
     sub.add_parser("serve", help="启动本地采集、计算与管理页面")
     sub.add_parser("receiver", help="启动只接收结果的云端服务")
     sub.add_parser("selftest", help="真实下载少量Events/GKG批次并测试解析、计算、快照，退出清理测试数据")
+    sub.add_parser('doctor', help='检查存储权限、临时目录和数据库完整性，不修复或删除数据')
     push = sub.add_parser("push", help="上传最新结果快照")
     push.add_argument("--url", required=True, help="接收器完整地址，例如 https://域名/api/snapshots")
     push.add_argument("--token-env", default="GDELT_PUSH_TOKEN", help="上传令牌所在环境变量名")
@@ -37,6 +38,12 @@ def main():
     elif args.command == "selftest":
         from .selftest import real_selftest
         print(json.dumps(real_selftest(settings), ensure_ascii=False, indent=2))
+    elif args.command == 'doctor':
+        from .diagnostics import diagnose
+        result = diagnose(settings)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if not result['ok']:
+            raise SystemExit(1)
     else:
         parsed = urlparse(args.url)
         if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")):

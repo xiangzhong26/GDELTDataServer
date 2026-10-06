@@ -71,3 +71,102 @@ def test_pending_expiration_keeps_completed_history_ledger(store):
     store.prune()
     assert store.stats()['ledger']=={'done':1,'expired':1}
     assert store.pending(20)==[]
+
+
+def test_date_backfill_exact_utc_start_and_retention_survives_restart(tmp_path, monkeypatch):
+    from datetime import date, datetime, timezone
+    from gdelt_server.service import Service
+    from gdelt_server.store import DAY
+    settings = Settings(data_dir=tmp_path, day_retention_days=730, min_free_gb=.1)
+    service = Service(settings)
+    try:
+        assert service.request("backfill", start_date=date(2020, 1, 1))["accepted"]
+        assert service.job["start_ts"] == int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
+        assert service.settings.day_retention_days == 3650
+        assert settings.day_retention_days == 730
+        spans = []
+        monkeypatch.setattr(service.store, "enqueue", lambda a,b: spans.append((a,b)) or 0)
+        service.ingestor.backfill(service.job["hours"], service.job["start_ts"])
+        assert spans[0][0] == service.job["start_ts"]
+        monkeypatch.undo()
+        old = int(utcnow().timestamp()) // DAY * DAY - 1000 * DAY
+        service.store.enqueue(old, old+SLOT)
+        service.store.apply('events', old, {'agg_geo': {('hour', old, 'US', '01'): {'n_events': 2}}}, 2)
+        service.store.prune(service.settings.hour_retention_days, service.settings.day_retention_days)
+        assert any(r['file_ts'] == old for r in service.store.pending(10))
+        with service.store.connect() as db:
+            assert db.execute("SELECT SUM(n_events) FROM agg_geo WHERE granularity='day'").fetchone()[0] == 2
+            assert db.execute("SELECT COUNT(*) FROM agg_geo WHERE granularity='hour'").fetchone()[0] == 0
+    finally:
+        service.ingestor.close()
+    restored = Service(settings)
+    try:
+        assert restored.settings.day_retention_days == 3650
+        assert restored.job['start_date'] == '2020-01-01'
+    finally:
+        restored.ingestor.close()
+
+
+def test_invalid_date_backfill_does_not_change_retention(tmp_path):
+    from datetime import date, timedelta
+    from gdelt_server.service import Service
+    service = Service(Settings(data_dir=tmp_path))
+    try:
+        for start in (date(2015, 2, 18), utcnow().date()+timedelta(days=1),
+                      utcnow().date()-timedelta(days=3651)):
+            with pytest.raises(ValueError):
+                service.request('backfill', start_date=start)
+        assert service.store.get_state('backfill_retention_days') is None
+        assert service.job is None
+    finally:
+        service.ingestor.close()
+
+
+def test_backfill_request_validation_and_persisted_job_resume(tmp_path, monkeypatch):
+    from gdelt_server.service import Service
+    settings = Settings(data_dir=tmp_path, batch_files=8, snapshot_days=[7], min_free_gb=.1)
+    service = Service(settings)
+    assert service.request('backfill', hours=1)['accepted']
+    service.ingestor.close()
+    processed = []
+    def process(self, kind, ts):
+        processed.append((kind,ts))
+        return self.store.apply(kind,ts,{},1)
+    monkeypatch.setattr(Ingestor, 'process', process)
+    with TestClient(create_app(settings)) as client:
+        wait_until(lambda: client.get('/api/gdelt/status').json()['job'] is None)
+        assert len(processed) == 8
+        assert not client.get('/api/gdelt/status').json()['monitor_enabled']
+        for body in ({'hours':1, 'start_date':'2020-01-01'}, {'start_date':'invalid'}):
+            assert client.post('/api/admin/backfill',json=body).status_code == 422
+    restored = Service(settings)
+    try:
+        assert restored.job is None
+    finally:
+        restored.ingestor.close()
+
+
+def test_shutdown_during_backfill_preserves_job_for_resume(tmp_path, monkeypatch):
+    import threading
+    from gdelt_server.service import Service
+    entered, release = threading.Event(), threading.Event()
+    def process(self,kind,ts):
+        entered.set()
+        assert release.wait(10)
+        return self.store.apply(kind,ts,{},1)
+    monkeypatch.setattr(Ingestor,'process',process)
+    settings=Settings(data_dir=tmp_path,batch_files=8,snapshot_days=[7],min_free_gb=.1)
+    service=Service(settings)
+    service.request('backfill',hours=1)
+    service.start()
+    try:
+        assert entered.wait(10)
+        service.shutdown.set()
+        service.ingestor.cancel.set()
+    finally:
+        release.set()
+        service.close()
+    assert service.store.get_state('active_backfill')['seeded']
+    with TestClient(create_app(settings)) as client:
+        wait_until(lambda:client.get('/api/gdelt/status').json()['job'] is None)
+        assert client.get('/api/gdelt/status').json()['storage']['ledger']['done']==8

@@ -964,7 +964,8 @@ class Metrics(BaseMetrics):
         if start >= today:
             return None
         cache = getattr(self, "_momentum_coverage", {})
-        key = (start, today, self.store.get_state("data_version", 0))
+        version = getattr(self, '_query_version', None)
+        key = (start, today, self.store.get_state("data_version", 0) if version is None else version)
         if key not in cache:
             cache[key] = self.store.coverage_buckets("events", start, today, DAY)
         self._momentum_coverage = cache
@@ -1010,6 +1011,8 @@ class Metrics(BaseMetrics):
                              ("event_count", "mentions", "attitude_score", "avg_goldstein", "avg_tone"))
 
     def country_risk(self, days=30, country="US"):
+        self._query_version = self.store.get_state('data_version', 0)
+        self._momentum_coverage = {}
         self._momentum_window_start = bucket_of(make_window(days).start, "day")
         result = super().country_risk(days, country)
         win, p = make_window(days), self.params()

@@ -19,7 +19,7 @@ GDELT 15分钟批次
 - 下载和解析串行进行，单轮默认32个文件，避免并发占用带宽、内存和磁盘。
 - 首次增量调度覆盖最近72小时；按批次游标逐段补齐。开监控后会连续处理积压，追平后默认每15分钟检查一次。
 - 手动回填会把全部目标批次加入持久队列，分批续跑。回填72小时应包含576个文件，处理上限只限制每轮，不截断整个回填范围。
-- 重启沿用批次进度与监控开关。失败批次指数退避重试，最长间隔6小时；未完成队列先处理未尝试批次，再处理到期重试。
+- 重启沿用批次进度与监控开关。失败批次指数退避重试，最长间隔6小时；每批为到期重试和最近一天文件预留处理名额，其余处理历史，避免多年回填饿死更新或失败重试。
 - 完成账本不会按小时保留期删除，同一批次不会重复累加。保留期外待处理批次标记为expired；若要补更久历史，请先扩大保留期，再重新加入对应范围。
 - 小时聚合默认保留60天，日聚合730天；日统计直接按文件累加，绝不从残缺小时表重建。
 - 快照只保留最新两份；成功或失败下载均清理临时文件，进程意外退出遗留的临时ZIP在下次独占启动时清理。
@@ -63,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## Linux 本地服务器
+## Linux 本地服务器（系统Python）
 
 把源代码解压到 `/opt/GDELTDataServer`（也可使用其他目录），安装Python 3.11+及venv组件，然后：
 
@@ -90,6 +90,8 @@ cp config.example.json config.local.json
 项目用进程锁保护同一data目录，不支持对同一目录开启多个服务进程或worker。数据库损坏或意外删除会失去去重账本，因此应定期备份聚合数据库：暂停服务后备份 `data/gdelt.db`，或者使用SQLite在线backup接口。不要只复制正在写入的主文件而漏掉WAL。
 
 ## 配置
+
+使用uv部署请优先看文末“Ubuntu完整部署（uv）”；上面的start.sh使用系统Python。
 
 相对 `data_dir` 按配置文件所在目录解析。修改容量预算、保留期、端口后重启服务。
 
@@ -159,11 +161,42 @@ $env:GDELT_PUSH_TOKEN = '<接收端令牌>'
 | GET /api/gdelt/ai-snapshot?days=30&iso3=USA&fips=US | 仅聚合数字的AI快照 |
 | POST /api/admin/monitor | `{"enabled":true}` 开启，false停止 |
 | POST /api/admin/sync | 处理一批增量任务，不开启持续监控 |
-| POST /api/admin/backfill | `{"hours":72}` 分批处理完整回填范围 |
+| POST /api/admin/retry | 失败文件设为立即可重试；已有回填等待重试时唤醒原任务 |
+| POST /api/admin/backfill | `{"hours":72}` 或 `{"start_date":"2020-01-01"}`，分批回填至今 |
 | PUT /api/admin/params | 修改并校验计算参数 |
 | POST /api/admin/export | 后台生成完整快照 |
 
 后台任务请求立即返回accepted，进度通过status查询。停止监控会请求取消当前下载；已提交入库的数据不回滚，临时文件随后清理。遇到超时需要等待当前网络读结束。
+
+## 从2020年开始回填与Ubuntu更新（uv）
+
+管理页面的“历史起始日期（UTC）”默认是 `2020-01-01`。点击“从此日期回填至今”后，服务按十五分钟时段下载 Events 与 GKG，处理后删除原始文件，已完成批次跳过。日期从当天 UTC 零点开始，范围最多3650天。小时回填和日期回填不能在同一次请求中同时指定。
+
+日期回填自动把实际日聚合保留期扩大至3650天，并写入数据库。即使服务器的旧 `config.local.json` 仍是730天，重启后也采用较大的已保存保留期，无需修改服务器配置。小时保留期保持原值；3650天是滚动保留期。管理页的状态栏显示实际日保留期。当前查询与快照仍只支持7、30、90、365天窗口，保存多年日聚合不代表已经支持任意历史日期查询。
+
+未完成的回填任务写入数据库，服务重启后自动续跑（即使持续监控关闭）。在页面关闭监控会取消当前任务；再次提交同一起始日期可续补。任务结束后仍可能存在等待重试的失败文件，不能仅凭任务结束判断历史完整，需检查失败记录并开启监控或重新提交回填。
+
+多年首次回填有大量下载和解析工作。建议先测试一天的实际吞吐，再启动多年范围，并监测磁盘和失败数量。数据库预算或磁盘余量不足时，程序暂停下载并报告错误。
+
+在本地将修改提交并推送到 GitHub，然后在按本项目 `/opt` 方案部署的 Ubuntu 服务器执行：
+
+```bash
+GDELT_UV_BIN="$(command -v uv)"
+sudo systemctl stop gdelt-data-server
+cd /opt/GDELTDataServer
+sudo git pull --ff-only
+sudo env UV_PYTHON_INSTALL_DIR=/opt/gdelt-python \
+  "$GDELT_UV_BIN" pip install \
+  --python /opt/GDELTDataServer/.venv/bin/python -e '.[test]'
+sudo .venv/bin/python -m pytest -q
+# 测试通过后更新模板；本次disk I/O修复必须执行以下两行
+sudo cp deploy/gdelt-data-server.service /etc/systemd/system/gdelt-data-server.service
+sudo systemctl daemon-reload
+sudo systemctl start gdelt-data-server
+curl --noproxy '*' http://127.0.0.1:8800/health
+```
+
+保留 `data/`、`.venv/` 和 `config.local.json`。私有仓库拉取时仍需 GitHub 认证。更新后刷新管理页面，选择起始日期并提交回填；拉取代码和重启本身不会自动启动多年回填。
 
 ## 计算口径和限制
 
@@ -172,7 +205,7 @@ $env:GDELT_PUSH_TOKEN = '<接收端令牌>'
 - 动量只用近期连续且已完整采集的UTC自然日。基线只纳入窗口内完整日，近期日或基线不足时以50中性值参与总分，返回momentum_available=false。
 - 缺采集的趋势点为null；完整采集后没有该国事件才为0；采集不完整的桶保留观察值并标记complete=false。
 - 每个数据源独立报告截至批次、完成文件数、预期文件数、覆盖率及过时状态。最后批次只表示最新收到的文件，不能证明前面的所有批次已补齐。
-- 时间窗口使用含当前未完整桶的自然日/小时桶：30天返回30个日桶，7天返回168个小时桶。不是精确到秒的滚动时间区间；查询过程的一致性由发布快照保证，对在线查询不提供跨多个SQL语句的事务快照。
+- 时间窗口使用含当前未完整桶的自然日/小时桶：30天返回30个日桶，7天返回168个小时桶。不是精确到秒的滚动时间区间；在线指标查询使用只读事务保证一次计算的一致性，切换国家复用最多15秒的查询缓存，刷新按钮强制重算。
 - 批次时间以官方文件名为准，避免损坏或空时间字段把历史数据计入当前时间。
 - 港澳台排除规则沿用原站；海外风险排名另排除中国大陆。GKG同一报道涉及多个国家时分别计数，各国篇数不能相加作为全球去重报道数。
 - 信源是引用次数之和，不是窗口内去重媒体数。样本充分度与时间覆盖率分别解释，充分度100不能表示30天采集完整。
@@ -196,3 +229,182 @@ gdelt_server/
 tests/            隔离数据库、模拟下载及两端联调测试
 deploy/           Linux服务模板与Dockerfile
 ```
+
+## Ubuntu完整部署（uv）
+
+已有部署的日常更新只需要一条命令，见文末“一条命令更新”。
+
+以下采用 `/opt/GDELTDataServer` 项目目录、`/opt/gdelt-python` Python目录、专用 `gdelt` 服务用户。Python在 `/opt` 下，避免服务的 `ProtectHome=true` 阻止读取个人目录里的uv解释器。不要复制Windows的 `.venv` 到Ubuntu。
+
+### 1. 下载项目
+
+在有sudo权限的Ubuntu登录用户终端执行：
+
+```bash
+uv --version
+sudo apt update
+sudo apt install -y git curl ca-certificates
+GDELT_UV_BIN="$(command -v uv)"
+sudo git clone https://github.com/xiangzhong26/GDELTDataServer.git /opt/GDELTDataServer
+cd /opt/GDELTDataServer
+```
+
+已有目录时跳过克隆，按前文“从2020年开始回填与Ubuntu更新（uv）”更新。公开仓库克隆不需要认证；私有仓库在HTTPS的Password提示中输入有该仓库Contents只读权限的GitHub Token，不能使用账号密码。不要把Token写入URL或提交到仓库。
+
+### 2. 准备环境
+
+```bash
+sudo env UV_PYTHON_INSTALL_DIR=/opt/gdelt-python \
+  "$GDELT_UV_BIN" python install 3.12
+sudo env UV_PYTHON_INSTALL_DIR=/opt/gdelt-python \
+  "$GDELT_UV_BIN" venv --python 3.12 .venv
+sudo env UV_PYTHON_INSTALL_DIR=/opt/gdelt-python \
+  "$GDELT_UV_BIN" pip install \
+  --python /opt/GDELTDataServer/.venv/bin/python -e '.[test]'
+sudo chmod -R a+rX /opt/gdelt-python
+```
+
+### 3. 创建用户和配置
+
+```bash
+if ! id gdelt >/dev/null 2>&1; then
+  sudo useradd --system --user-group \
+    --home-dir /opt/GDELTDataServer --shell /usr/sbin/nologin gdelt
+fi
+sudo mkdir -p /opt/GDELTDataServer/data
+sudo chown gdelt:gdelt /opt/GDELTDataServer/data
+sudo chmod 750 /opt/GDELTDataServer/data
+if [ ! -f config.local.json ]; then
+  sudo cp config.example.json config.local.json
+fi
+sudo chown root:gdelt config.local.json
+sudo chmod 640 config.local.json
+```
+
+默认监听 `127.0.0.1:8800`，首次监控关闭。配置文件不会被Git更新覆盖。
+
+### 4. 测试并安装服务
+
+```bash
+sudo .venv/bin/python -m pytest -q
+sudo -u gdelt .venv/bin/python -m gdelt_server --config config.local.json selftest
+```
+
+两项都成功后执行：
+
+```bash
+sudo cp deploy/gdelt-data-server.service /etc/systemd/system/gdelt-data-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now gdelt-data-server
+sudo systemctl status gdelt-data-server --no-pager
+curl --noproxy '*' http://127.0.0.1:8800/health
+```
+
+预期服务为 `active (running)`，健康接口返回 `{"ok":true,"service":"gdelt-data-server"}`。模板的 `PrivateTmp=true` 为只读系统保护下的SQLite排序、分组提供可写临时目录。只运行一个worker。
+
+### 5. 从Windows访问
+
+在你自己的Windows PowerShell里替换用户名和Ubuntu地址：
+
+```powershell
+ssh -N -L 18800:127.0.0.1:8800 你的用户名@Ubuntu服务器IP
+```
+
+保持窗口打开，浏览器访问 [管理页面](http://127.0.0.1:18800/)。先回填1小时，检查成功、失败、四个指标和时间范围切换，再扩大历史范围或开启监控。SSH断开仅关闭访问通道，后台服务继续运行。
+
+### 本地修改后推送
+
+在Windows的GDELTDataServer项目中执行；确认变更列表后提交：
+
+```powershell
+cd C:\Users\workm\Desktop\GDELTDataServer
+git status --short
+git add README.md 测试记录.md gdelt_server tests deploy/gdelt-data-server.service
+git commit -m "Fix dashboard queries, storage permissions and retry handling"
+git push
+```
+
+然后执行前文Ubuntu更新步骤，包括重新安装systemd模板。保留 `data/`、`.venv/` 和 `config.local.json`。更新完成后强制刷新管理页面（Ctrl+F5）。
+
+## 页面响应、失败重试与disk I/O故障排查
+
+### 页面选择没有反应或切换慢
+
+新版在指标/时间范围旁显示加载状态和耗时。连续切换取消旧请求，只显示最后选择的结果；请求失败在查询区显示错误并清除旧结果。超过30秒提示超时。
+
+同一视图和时间范围的排名、各国趋势批量计算，最多缓存15秒、最多8组；切换国家复用结果。点击“刷新数据”绕过缓存。在线指标的一次计算使用只读事务，保持排名、趋势和覆盖率的一致性。采集写入、首次长窗口查询和快照生成仍有负载，实际耗时取决于硬件和数据规模。浏览器取消请求不保证服务器已开始的计算立即停止。
+
+“对华关系总览”初始显示全部国家总览，点击国家行后右侧显示该国对华趋势，左侧排名保持总览。切换指标重置国家。缺采集显示空白；刚采集少量数据，30/90/365天覆盖率低是正常现象。
+
+### 失败待重试
+
+页面显示最近失败文件的来源、时间、错误、尝试次数和下次重试时间。成功文件不重复累加。自动重试首次等待约2分钟，之后指数退避，最长6小时；持续监控或未结束回填会按到期时间唤醒。修复问题后点击“立即重试失败”跳过等待；正在处理文件时，等当前批次完成后再点击。
+
+- 超时、断网、连接错误：检查服务器到GDELT的网络，恢复后重试。
+- HTTP404：文件可能尚未发布，也可能历史源缺失。等待重试并核对日志中的文件URL；持续404不能标记为完成。
+- 文件过大或解析错误：核对文件时间和格式；按原因调整大小上限或更新解析规则。
+- 磁盘余量或数据库预算：查看配置和占用，腾出空间或扩大预算，不要删除数据库或账本清零。
+
+### disk I/O error
+
+这是SQLite无法完成I/O，不等于磁盘满，不能仅凭截图判定硬盘损坏。旧服务模板的 `ProtectSystem=strict` 没有可写隔离临时目录；较大排序和分组可能需要临时文件，这是部署缺陷。新版加入 `PrivateTmp=true`，必须按更新步骤重新复制模板、daemon-reload并重启，单纯git pull不会更新已安装的模板。
+
+更新后先在页面切换四个视图和一年窗口，再检查：
+
+```bash
+sudo journalctl -u gdelt-data-server -n 200 --no-pager
+sudo systemctl show gdelt-data-server -p PrivateTmp -p ProtectSystem -p ReadWritePaths
+df -h /opt/GDELTDataServer/data /tmp
+df -i /opt/GDELTDataServer/data /tmp
+namei -l /opt/GDELTDataServer/data/gdelt.db
+```
+
+确认 `PrivateTmp=yes`。数据目录、数据库及 `gdelt.db-wal`/`gdelt.db-shm`（若存在）必须允许gdelt用户读写。如果文件因先前sudo手动启动归属root，修正明确的数据目录归属：
+
+```bash
+sudo systemctl stop gdelt-data-server
+sudo chown -R gdelt:gdelt /opt/GDELTDataServer/data
+sudo -u gdelt /opt/GDELTDataServer/.venv/bin/python -m gdelt_server \
+  --config /opt/GDELTDataServer/config.local.json doctor
+```
+
+`doctor` 测试目录写入，并用只读连接执行数据库 `quick_check`，不删除或修复数据库。首次未初始化时会报告数据库不存在，检查大数据库可能耗时。手动doctor在服务隔离环境外运行，不能代替管理页面的真实查询测试。检查通过后再启动：
+
+```bash
+sudo systemctl start gdelt-data-server
+```
+
+如果错误持续，检查系统磁盘日志和挂载状态：
+
+```bash
+sudo journalctl -k -n 100 --no-pager
+findmnt -T /opt/GDELTDataServer/data
+```
+
+核对文件系统是否只读、硬盘错误、网络盘兼容性和剩余inode。保留日志中的 `SQLITE_IOERR_*` 扩展错误码。如果quick_check未通过，先停止写入、备份数据库和残留WAL/SHM，再按具体损坏恢复；不要直接删除数据库、WAL或覆盖回填。
+
+官方依据：[systemd文件系统保护与PrivateTmp](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)、[SQLite临时文件](https://www.sqlite.org/tempfiles.html)、[SQLite扩展错误码](https://www.sqlite.org/rescode.html)。
+
+## 一条命令更新
+
+在本地提交并推送GitHub后，在Ubuntu登录用户的终端执行：
+
+```bash
+bash /opt/GDELTDataServer/deploy/update.sh
+```
+
+脚本自动定位当前用户的uv并请求sudo权限，依次完成：获取远程更新、检查可快进、停止服务、更新代码、安装依赖、运行全部测试、安装新版systemd模板、daemon-reload、启动与健康检查。无需手动激活环境、修改配置或逐条执行部署命令。即使代码已是最新，也会重新验证依赖和服务模板。
+
+如果服务器还是没有update.sh的旧版本，首次执行下面这一整行获取脚本并完成更新：
+
+```bash
+sudo systemctl stop gdelt-data-server && sudo git -C /opt/GDELTDataServer pull --ff-only && bash /opt/GDELTDataServer/deploy/update.sh
+```
+
+此后只使用第一条命令。首次引导命令先停止服务，如果拉取失败，修复网络或认证后重新运行；不要把失败当作更新完成。
+
+适用范围是本文的 `/opt/GDELTDataServer`、uv解释器在 `/opt/gdelt-python`、服务名 `gdelt-data-server`、本机健康接口端口8800的部署方案。更改目录、端口或服务名时需要对应调整脚本。
+
+私有仓库仍可能询问GitHub Token；一条命令不会绕过GitHub认证。服务器工作目录存在未提交或未跟踪内容、分支分叉时，脚本停止更新以保留内容，不执行reset或clean。获取更新在停止服务之前进行；后续安装、测试或健康检查失败时服务保持停止，并显示错误，修复后重跑命令。数据和本地配置保留，不自动创建可能占满磁盘的全量数据库副本，也不自动回退数据库。
+
+脚本检查了Bash语法，项目测试在Windows通过；完整systemd更新流程需在Ubuntu实际执行验证。

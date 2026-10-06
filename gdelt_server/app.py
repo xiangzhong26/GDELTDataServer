@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import fields
+from datetime import date
 import hmac
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, model_validator
 
 from .config import Settings
 from .instance import InstanceLock
@@ -30,7 +32,16 @@ class MonitorBody(BaseModel):
 
 
 class BackfillBody(BaseModel):
-    hours: int = Field(72, ge=1, le=87600)
+    hours: int | None = Field(None, ge=1, le=87600)
+    start_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.hours is not None and self.start_date is not None:
+            raise ValueError("小时数和起始日期只能选择一个")
+        if self.hours is None and self.start_date is None:
+            self.hours = 72
+        return self
 
 
 def create_app(settings=None):
@@ -52,6 +63,14 @@ def create_app(settings=None):
             lock.release()
 
     app = FastAPI(title="GDELT 独立数据服务器", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(sqlite3.Error)
+    async def database_error(request, exc):
+        code = getattr(exc, 'sqlite_errorname', 'SQLITE_ERROR')
+        logging.getLogger(__name__).exception('数据库请求失败 %s: %s', code, exc)
+        return JSONResponse(status_code=503, content={
+            'detail': f'数据库暂时无法完成查询：{code}。请查看服务日志，并检查数据目录、临时目录权限和磁盘状态。',
+            'sqlite_error': code})
 
     def auth(request: Request, authorization: str = Header(default="")):
         authorize(settings, request, authorization)
@@ -81,7 +100,9 @@ def create_app(settings=None):
                 "has_data": bool(service.store.get_state("data_version", 0)),
                 "raw_data_retained": False}
 
-    def metric_result(name, days, country="US", view="china"):
+    def metric_result(name, days, country="US", view="china", fresh=False):
+        if name != 'overview' or view == 'china':
+            return app.state.service.queries.resolve(name, days, country, fresh)
         store = app.state.service.store
         metrics = Metrics(store)
         if name == "overview":
@@ -89,22 +110,22 @@ def create_app(settings=None):
         return getattr(metrics, name.replace("-", "_"))(days, country)
 
     @app.get("/api/gdelt/overview", dependencies=protected)
-    def overview(days: int = Query(30, ge=1, le=365), country: str = "USA", view: str = "china"):
+    def overview(days: int = Query(30, ge=1, le=365), country: str = "", view: str = "china", fresh: bool = False):
         if view not in ("china", "partner"):
             raise HTTPException(400, "view仅支持china或partner")
-        return metric_result("overview", days, country.upper(), view)
+        return metric_result("overview", days, country.upper(), view, fresh)
 
     @app.get("/api/gdelt/attitude", dependencies=protected)
-    def attitude(days: int = Query(30, ge=1, le=365), country: str = "USA"):
-        return metric_result("attitude", days, country.upper())
+    def attitude(days: int = Query(30, ge=1, le=365), country: str = "USA", fresh: bool = False):
+        return metric_result("attitude", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/country-risk", dependencies=protected)
-    def country_risk(days: int = Query(30, ge=1, le=365), country: str = "US"):
-        return metric_result("country-risk", days, country.upper())
+    def country_risk(days: int = Query(30, ge=1, le=365), country: str = "US", fresh: bool = False):
+        return metric_result("country-risk", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/enterprise-risk", dependencies=protected)
-    def enterprise_risk(days: int = Query(30, ge=1, le=365), country: str = "US"):
-        return metric_result("enterprise-risk", days, country.upper())
+    def enterprise_risk(days: int = Query(30, ge=1, le=365), country: str = "US", fresh: bool = False):
+        return metric_result("enterprise-risk", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/metrics", dependencies=protected)
     def catalog():
@@ -137,10 +158,14 @@ def create_app(settings=None):
     def sync():
         return app.state.service.request("sync")
 
+    @app.post('/api/admin/retry', dependencies=protected)
+    def retry():
+        return app.state.service.request('retry')
+
     @app.post("/api/admin/backfill", dependencies=protected)
     def backfill(body: BackfillBody):
         try:
-            return app.state.service.request("backfill", body.hours)
+            return app.state.service.request("backfill", body.hours, body.start_date)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

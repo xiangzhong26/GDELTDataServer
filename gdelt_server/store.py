@@ -6,6 +6,7 @@ Daily data is never reconstructed from potentially expired hourly data.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import copy
 from datetime import datetime, timezone
 import json
 import math
@@ -59,6 +60,11 @@ class Store:
 
     @contextmanager
     def connect(self, write=False):
+        if hasattr(self, '_read_connection'):
+            if write:
+                raise RuntimeError('不能向查询快照写入数据')
+            yield self._read_connection
+            return
         db = sqlite3.connect(self.path, timeout=60)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=60000")
@@ -73,6 +79,14 @@ class Store:
             raise
         finally:
             db.close()
+
+    @contextmanager
+    def read_snapshot(self):
+        with self.connect() as db:
+            db.execute('BEGIN')
+            view = copy(self)
+            view._read_connection = db
+            yield view
 
     def initialize(self):
         with self.connect() as db:
@@ -99,6 +113,7 @@ class Store:
                     PRIMARY KEY(kind,file_ts)) WITHOUT ROWID;
                 CREATE INDEX IF NOT EXISTS ix_file_pending ON ingest_file(status,next_retry,file_ts);
                 CREATE INDEX IF NOT EXISTS ix_file_time ON ingest_file(kind,file_ts,status);
+                CREATE INDEX IF NOT EXISTS ix_file_work ON ingest_file(status,file_ts);
             """)
 
     def get_state(self, key, default=None):
@@ -121,7 +136,9 @@ class Store:
         end -= end % SLOT
         with self.connect(write=True) as db:
             before = db.total_changes
-            db.executemany("INSERT OR IGNORE INTO ingest_file(kind,file_ts) VALUES (?,?)",
+            db.executemany("INSERT INTO ingest_file(kind,file_ts) VALUES (?,?) "
+                           "ON CONFLICT(kind,file_ts) DO UPDATE SET status='pending',attempts=0,next_retry=0,error=NULL "
+                           "WHERE ingest_file.status='expired'",
                            ((kind, ts) for ts in range(start, end, SLOT) for kind in ("events", "gkg")))
             count = db.total_changes - before
             if cursor is not None:
@@ -130,10 +147,22 @@ class Store:
 
     def pending(self, limit, now=None):
         now = now if now is not None else int(utcnow().timestamp())
+        if limit <= 0:
+            return []
         with self.connect() as db:
-            return [dict(r) for r in db.execute(
+            # Reserve part of each batch for retries and recent files, so a multi-year
+            # history queue cannot starve live updates or indefinitely defer failures.
+            quota = max(1, limit//4)
+            rows = list(db.execute("SELECT * FROM ingest_file WHERE status='failed' AND next_retry<=? "
+                                   "ORDER BY next_retry,file_ts,kind LIMIT ?", (now, quota)))
+            rows += list(db.execute("SELECT * FROM ingest_file WHERE status='pending' AND file_ts>=? "
+                                    "ORDER BY file_ts,kind LIMIT ?", (now-DAY, min(quota, limit-len(rows)))))
+            excluded = ' AND (kind,file_ts) NOT IN ('+','.join('(?,?)' for _ in rows)+')' if rows else ''
+            args = [v for r in rows for v in (r['kind'], r['file_ts'])]
+            rows += list(db.execute(
                 "SELECT * FROM ingest_file WHERE status IN ('pending','failed') AND next_retry<=? "
-                "ORDER BY attempts, file_ts,kind LIMIT ?", (now, limit))]
+                + excluded + " ORDER BY attempts,file_ts,kind LIMIT ?", (now, *args, limit-len(rows))))
+            return [dict(r) for r in rows]
 
     def mark_failed(self, kind, ts, error):
         now = int(utcnow().timestamp())
@@ -146,6 +175,19 @@ class Store:
             delay = min(21600, 60 * 2 ** min(attempt, 9))
             db.execute("UPDATE ingest_file SET status='failed',attempts=?,next_retry=?,error=? WHERE kind=? AND file_ts=?",
                        (attempt, now + delay, str(error)[:1000], kind, ts))
+
+    def has_unfinished(self):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM ingest_file WHERE status IN ('pending','failed') LIMIT 1").fetchone() is not None
+
+    def retry_delay(self):
+        with self.connect() as db:
+            ts = db.execute("SELECT MIN(next_retry) FROM ingest_file WHERE status IN ('pending','failed')").fetchone()[0]
+        return max(2, ts-int(utcnow().timestamp())) if ts is not None else 900
+
+    def retry_failed(self):
+        with self.connect(write=True) as db:
+            return db.execute("UPDATE ingest_file SET next_retry=0 WHERE status='failed'").rowcount
 
     def apply(self, kind, ts, tables, rows, skipped=0):
         """Commit file ledger and direct daily/hourly contributions together."""
