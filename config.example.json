@@ -16,5 +16,6 @@
   "max_uncompressed_mb": 1024,
   "request_timeout": 60,
   "api_token": "",
+  "snapshot_read_token": "",
   "snapshot_days": [7, 30, 90, 365]
 }

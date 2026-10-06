@@ -24,6 +24,7 @@ class Settings(BaseModel):
     max_uncompressed_mb: int = Field(1024, ge=1, le=8192)
     request_timeout: int = Field(60, ge=5, le=300)
     api_token: str = ""
+    snapshot_read_token: str = ""
     snapshot_days: list[int] = Field(default_factory=lambda: [7, 30, 90, 365])
 
     @model_validator(mode="after")
@@ -36,6 +37,12 @@ class Settings(BaseModel):
             raise ValueError("snapshot_days 不能重复")
         if self.host not in ("127.0.0.1", "localhost", "::1") and len(self.api_token) < 24:
             raise ValueError("监听局域网/公网地址需要至少24字符的 api_token")
+        if self.snapshot_read_token and len(self.snapshot_read_token) < 24:
+            raise ValueError('快照只读令牌至少需要24字符')
+        if self.snapshot_read_token and self.snapshot_read_token == self.api_token:
+            raise ValueError('快照只读令牌不能与管理令牌相同')
+        if self.snapshot_read_token and len(self.api_token) < 24:
+            raise ValueError('启用快照只读令牌时必须同时配置至少24字符的管理令牌')
         return self
 
     @classmethod
@@ -44,6 +51,8 @@ class Settings(BaseModel):
         values = json.loads(Path(path).read_text(encoding="utf-8-sig")) if path else {}
         if os.environ.get("GDELT_API_TOKEN"):
             values["api_token"] = os.environ["GDELT_API_TOKEN"]
+        if os.environ.get('GDELT_SNAPSHOT_READ_TOKEN'):
+            values['snapshot_read_token'] = os.environ['GDELT_SNAPSHOT_READ_TOKEN']
         settings = cls(**values)
         if path and not settings.data_dir.is_absolute():
             settings.data_dir = Path(path).resolve().parent / settings.data_dir

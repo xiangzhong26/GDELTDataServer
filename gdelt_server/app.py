@@ -10,7 +10,8 @@ import sqlite3
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, model_validator
 
 from .config import Settings
@@ -83,6 +84,17 @@ def create_app(settings=None):
         authorize(settings, request, authorization)
 
     protected = [Depends(auth)]
+
+    def snapshot_auth(request: Request, authorization: str = Header(default='')):
+        token = settings.snapshot_read_token
+        if token and hmac.compare_digest(authorization, 'Bearer '+token):
+            return
+        # A configured read token closes the unauthenticated localhost fallback for exports.
+        if token and not settings.api_token:
+            raise HTTPException(401, '快照访问令牌无效', headers={'WWW-Authenticate':'Bearer'})
+        authorize(settings, request, authorization)
+
+    snapshot_protected = [Depends(snapshot_auth)]
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
@@ -232,21 +244,44 @@ def create_app(settings=None):
         finally:
             service.ingestor.busy.release()
 
-    @app.get("/api/snapshots/latest", dependencies=protected)
-    def manifest():
+    @app.get("/api/snapshots/latest", dependencies=snapshot_protected)
+    def manifest(if_none_match: str = Header(default='')):
         value = app.state.service.snapshots.manifest()
         if not value:
             raise HTTPException(404, "尚未生成快照")
-        return value
+        etag = '"'+value['sha256']+'"'
+        headers = {'ETag':etag, 'Cache-Control':'no-cache'}
+        if any(tag.strip() in (etag, 'W/'+etag, '*') for tag in if_none_match.split(',')):
+            return Response(status_code=304, headers=headers)
+        return JSONResponse(value, headers=headers)
 
-    @app.get("/api/snapshots/download", dependencies=protected)
-    def download():
+    def download_version(snapshot_id=None):
         files = app.state.service.snapshots
-        value = files.manifest()
-        if not value:
-            raise HTTPException(404, "尚未生成快照")
-        return FileResponse(files.folder/value["filename"], media_type="application/gzip",
-                            filename="gdelt-snapshot.json.gz", headers={"X-SHA256": value["sha256"]})
+        try:
+            value, stream = files.open_download(snapshot_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        def chunks():
+            try:
+                while block := stream.read(256*1024):
+                    yield block
+            finally:
+                stream.close()
+        return StreamingResponse(chunks(), media_type='application/gzip',
+            background=BackgroundTask(stream.close), headers={'X-SHA256':value['sha256'],
+            'X-Snapshot-ID':value['snapshot_id'], 'ETag':'"'+value['sha256']+'"',
+            'Content-Length':str(value['bytes']), 'Cache-Control':'private, no-store',
+            'Content-Disposition':'attachment; filename="gdelt-snapshot.json.gz"'})
+
+    @app.get('/api/snapshots/download', dependencies=snapshot_protected)
+    def download():
+        return download_version()
+
+    @app.get('/api/snapshots/versions/{snapshot_id}/download', dependencies=snapshot_protected)
+    def pinned_download(snapshot_id: str):
+        return download_version(snapshot_id)
 
     return app
 

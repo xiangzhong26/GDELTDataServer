@@ -546,3 +546,32 @@ bash /opt/GDELTDataServer/deploy/update.sh
 ```
 
 更新保留数据库、配置和回填进度。本地自动化测试覆盖下载进度、多进程状态、超时重试、暂停重启、快照阶段和页面显示；服务器具体卡住原因仍需结合新面板与Ubuntu日志判断。
+
+### 为DSI准备结果发布接口
+
+本地服务现在支持独立的快照只读令牌、版本检查（ETag/304）、按指定快照ID下载，以及每个时间范围的数据覆盖信息。旧配置继续有效，已有快照的元信息会在启动时升级，不重新计算或修改压缩内容。正常保留最近两份快照，正在下载的版本不会被新发布内容替换。接口契约见[docs/snapshot-api.md](docs/snapshot-api.md)。DSI的同步和页面接入需要在DSI项目另行开发。
+
+**正在运行旧版时无需为本地开发停服务。** 等新版推送后，运行更新脚本会停止旧服务、更新并重启，数据库进度保留。为了观察明确的收尾状态，可先在工作台点“暂停全部并保存进度”，等待没有在途文件且后台任务空闲，再执行更新；更新完成后用“继续上次回填”恢复。直接更新也保留已经提交的文件进度，未提交文件会重新处理。不要复制第二个实例共用数据目录。
+
+```bash
+bash /opt/GDELTDataServer/deploy/update.sh
+```
+
+只更新程序不要求立即配置隧道或只读令牌。本地可以继续回填；准备让DSI访问结果时，再进行下面一次性配置。
+
+按本文Ubuntu部署方式，在项目目录执行：
+
+```bash
+cd /opt/GDELTDataServer
+sudo systemctl stop gdelt-data-server
+sudo .venv/bin/python -m gdelt_server --config config.local.json configure-sync
+sudo chown gdelt:gdelt config.local.json
+sudo chmod 600 config.local.json
+sudo systemctl start gdelt-data-server
+```
+
+命令在已有`config.local.json`中补齐两种独立令牌，保留其他配置、文件所有者和权限，不修改数据；重复运行不更换已经存在的令牌。终端会显示两种令牌，请保密：`api_token`填到本地工作台的访问令牌框；`snapshot_read_token`仅配置在未来DSI云端同步服务中，不放进网页JavaScript、不提交GitHub。如果已经用环境变量提供凭据，继续使用环境变量，不要再用这个文件初始化命令。
+
+管理令牌生效后，工作台需要点击“连接”；原有监控和回填进度不会因配置令牌而清空。命令不改变监听地址。只读令牌可以通过`GDELT_SNAPSHOT_READ_TOKEN`环境变量覆盖，管理令牌仍通过`GDELT_API_TOKEN`覆盖。
+
+未来DSI的调用顺序是：`GET /api/snapshots/latest`检查版本，然后下载响应中的`download_path`，例如`/api/snapshots/versions/<snapshot_id>/download`。不要将最新数据日期当作同步版本，不要从该入口请求重新采集或计算。GDELT发布频率仍由本地`poll_seconds`控制（默认900秒；回填完成会强制发布）；云端每60秒检查不意味着本地每60秒生成结果。
