@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FI
 from concurrent.futures.process import BrokenProcessPool
 import logging
 import multiprocessing
+import queue
+from collections import deque
 import shutil
 import tempfile
 import threading
@@ -22,18 +24,30 @@ LOG = logging.getLogger(__name__)
 BASE = "https://data.gdeltproject.org/gdeltv2"
 
 _PARSER_CANCEL = None
+_PARSER_PROGRESS = None
 
 
-def _init_parser(cancel):
-    global _PARSER_CANCEL
+def _init_parser(cancel, progress=None):
+    global _PARSER_CANCEL, _PARSER_PROGRESS
     _PARSER_CANCEL = cancel
+    _PARSER_PROGRESS = progress
+    if progress is not None:
+        progress.cancel_join_thread()  # Workers must not wait for UI telemetry to drain on exit.
 
 
 def _parse_file(kind, path, ts, max_mb):
     parser = parse_gkg if kind == 'gkg' else parse_events
     started = time.monotonic()
-    parsed = parser(path, ts, max_mb, cancel=_PARSER_CANCEL)
+    def report(rows, stage='parsing'):
+        if _PARSER_PROGRESS is not None:
+            try:
+                _PARSER_PROGRESS.put_nowait((kind, ts, stage, rows, time.monotonic()))
+            except queue.Full:
+                pass  # Observability must never block processing.
+    report(0)
+    parsed = parser(path, ts, max_mb, cancel=_PARSER_CANCEL, progress=report)
     parsed.parse_seconds = time.monotonic()-started
+    report(parsed.rows, 'parse_transfer')
     return parsed
 
 
@@ -68,6 +82,46 @@ class Ingestor:
         self.parser_cancel = None
         self.parser_broken = False
         self.timings = {}
+        self.parser_progress = None
+        self.progress_lock = threading.Lock()
+        self.cycle = {}
+        self.recent_files = deque(maxlen=12)
+        self.last_completed = None
+        self.phase_started = time.monotonic()
+        self.last_stall_check = 0.
+
+    def set_phase(self, phase):
+        self.phase = phase
+        self.phase_started = time.monotonic()
+
+    def file_progress(self, kind, ts, **updates):
+        now = time.monotonic()
+        with self.active_lock:
+            row = self.active.get((kind, ts))
+            if row is not None:
+                if updates.get('stage', row['stage']) != row['stage']:
+                    row['stage_started'] = now
+                row.update(updates)
+                row['last_activity'] = now
+
+    def drain_parser_progress(self):
+        with self.progress_lock:
+            self._drain_parser_progress()
+
+    def _drain_parser_progress(self):
+        if self.parser_progress is not None:
+            while True:
+                try:
+                    kind, ts, stage, rows, reported = self.parser_progress.get_nowait()
+                except queue.Empty:
+                    break
+                # A delayed child message must not revert a file already committing.
+                with self.active_lock:
+                    row = self.active.get((kind, ts))
+                    if row is not None and reported >= row['started'] and row['stage'] in ('parse_pipeline', 'parsing', 'parse_transfer'):
+                        if stage != row['stage']:
+                            row['stage_started'] = reported
+                        row.update(stage=stage, parsed_rows=rows, last_activity=reported)
 
     def stop(self):
         self.cancel.set()
@@ -79,6 +133,7 @@ class Ingestor:
         if parser_workers != self.settings.parser_workers and self.parser_pool is not None:
             self.parser_pool.shutdown(wait=True, cancel_futures=True)
             self.parser_pool = self.parser_cancel = None
+            self.close_progress_queue()
         self.settings.download_workers = download_workers
         self.settings.parser_workers = parser_workers
         self.reconfigure.clear()
@@ -89,9 +144,7 @@ class Ingestor:
 
     @contextmanager
     def stage(self, kind, ts, name):
-        with self.active_lock:
-            if (kind, ts) in self.active:
-                self.active[(kind, ts)]['stage'] = name
+        self.file_progress(kind, ts, stage=name)
         started = time.monotonic()
         try:
             yield
@@ -103,8 +156,9 @@ class Ingestor:
             # Spawn avoids inheriting SQLite connections and locks from the web server.
             context = multiprocessing.get_context('spawn')
             self.parser_cancel = context.Event()
+            self.parser_progress = context.Queue(maxsize=256)
             self.parser_pool = ProcessPoolExecutor(self.settings.parser_workers, mp_context=context,
-                                                  initializer=_init_parser, initargs=(self.parser_cancel,))
+                                                  initializer=_init_parser, initargs=(self.parser_cancel, self.parser_progress))
         if self.parser_cancel is not None:
             if self.cancel.is_set():
                 self.parser_cancel.set()
@@ -112,14 +166,43 @@ class Ingestor:
                 self.parser_cancel.clear()
 
     def concurrency_status(self):
+        self.drain_parser_progress()
+        now = time.monotonic()
         with self.active_lock:
             return {'download_workers': self.settings.download_workers,
                     'parser_workers': self.settings.parser_workers,
-                    'active_files': [dict(row) for row in self.active.values()]}
+                    'active_files': [{**{k:v for k,v in row.items() if k not in ('started', 'stage_started', 'last_activity', 'warned_at')},
+                                      'elapsed_seconds': round(now-row['started'], 1),
+                                      'stage_seconds': round(now-row['stage_started'], 1),
+                                      'inactive_seconds': round(max(0., now-row['last_activity']), 1)}
+                                     for row in self.active.values()],
+                    'cycle': dict(self.cycle), 'recent_files': list(self.recent_files),
+                    'seconds_since_completion': round(now-self.last_completed, 1) if self.last_completed else None,
+                    'phase_seconds': round(now-self.phase_started, 1)}
+
+    def warn_stalled(self):
+        now = time.monotonic()
+        if now-self.last_stall_check < 5:
+            return
+        self.last_stall_check = now
+        warnings = []
+        with self.active_lock:
+            for row in self.active.values():
+                inactive = now-row['last_activity']
+                if inactive >= 60 and now-row.get('warned_at', 0) >= 60:
+                    row['warned_at'] = now
+                    warnings.append((row['filename'], row['stage'], round(inactive), row['parsed_rows']))
+        for filename, stage, inactive, rows in warnings:
+            LOG.warning('文件较久未报告进展 filename=%s stage=%s inactive_seconds=%s parsed_rows=%s',
+                        filename, stage, inactive, rows)
 
     def tracked_process(self, kind, ts):
         with self.active_lock:
-            self.active[(kind, ts)] = {'kind': kind, 'file_ts': ts, 'stage': 'starting'}
+            now = time.monotonic()
+            self.active[(kind, ts)] = {'kind': kind, 'file_ts': ts, 'stage': 'starting',
+                                      'filename': file_url(kind, ts).rsplit('/', 1)[1],
+                                      'started': now, 'stage_started': now, 'last_activity': now,
+                                      'downloaded_bytes': 0, 'total_bytes': None, 'parsed_rows': 0}
             self.current_file = next(iter(self.active.values()))
         try:
             if self.cancel.is_set():
@@ -193,6 +276,7 @@ class Ingestor:
             raise ValueError("批次已超出保留期，请先扩大日保留期")
         path = None
         try:
+            download_started = time.monotonic()
             with self.stage(kind, ts, 'download'), tempfile.NamedTemporaryFile(prefix="gdelt-", suffix=".zip", dir=self.temp_dir, delete=False) as f:
                 path = Path(f.name)
                 size = 0
@@ -200,19 +284,26 @@ class Ingestor:
                         self.settings.request_timeout, connect=min(5, self.settings.request_timeout),
                         read=min(5, self.settings.request_timeout))) as response:
                     response.raise_for_status()
+                    total = response.headers.get('Content-Length', '')
+                    self.file_progress(kind, ts, total_bytes=int(total) if total.isdigit() else None)
                     # Check cancellation on each received chunk, not after accumulating 1MB.
                     for block in response.iter_bytes():
                         if self.cancel.is_set():
                             raise InterruptedError("同步已停止，批次将在后续重试")
+                        if time.monotonic()-download_started > self.settings.request_timeout:
+                            raise httpx.ReadTimeout('单文件下载超过总时限，保留进度后自动重试')
                         size += len(block)
                         if size > self.settings.max_download_mb*1024*1024:
                             raise ValueError("下载文件超过单文件大小上限")
                         f.write(block)
+                        self.file_progress(kind, ts, downloaded_bytes=size)
             parser = parse_gkg if kind == "gkg" else parse_events
             parse_started = time.monotonic()
             with self.stage(kind, ts, 'parse_pipeline'):
                 if self.parser_pool is None:
-                    parsed = parser(path, ts, self.settings.max_uncompressed_mb, cancel=self.cancel)
+                    self.file_progress(kind, ts, stage='parsing')
+                    parsed = parser(path, ts, self.settings.max_uncompressed_mb, cancel=self.cancel,
+                                    progress=lambda rows: self.file_progress(kind, ts, parsed_rows=rows))
                     parsed.parse_seconds = time.monotonic()-parse_started
                 else:
                     try:
@@ -220,6 +311,7 @@ class Ingestor:
                         # Keep the ZIP until the parser finishes, including during cancellation.
                         while not future.done():
                             wait((future,), timeout=.05)
+                            self.drain_parser_progress()
                             if self.cancel.is_set():
                                 self.parser_cancel.set()
                                 future.cancel()
@@ -229,6 +321,7 @@ class Ingestor:
                     except BrokenProcessPool:
                         self.parser_broken = True
                         raise
+            self.file_progress(kind, ts, parsed_rows=parsed.rows)
             self.record_timing('parse_compute', parsed.parse_seconds)
             self.record_timing('parse_queue_transfer', max(0., time.monotonic()-parse_started-parsed.parse_seconds))
             if parsed.rows == 0:
@@ -255,19 +348,27 @@ class Ingestor:
         try:
             with self.active_lock:
                 self.timings = {}
+                self.cycle = {'total': 0, 'completed': 0, 'succeeded': 0, 'failed': 0, 'cancelled': 0}
             if clear_cancel:
                 self.cancel.clear()
-            self.phase = "scheduling"
+            self.set_phase('scheduling')
             if time.monotonic()-self.last_prune >= 3600:
+                self.set_phase('pruning')
                 self.store.prune(self.settings.hour_retention_days, self.settings.day_retention_days)
                 self.last_prune = time.monotonic()
+                self.set_phase('scheduling')
             if schedule:
                 self.schedule()
             self.check_disk()
             pending = self.store.pending(limit or max(self.settings.batch_files, self.settings.download_workers), ranges=ranges,
                                          exclude_range=exclude_range, descending=descending)
             scheduling_seconds = time.monotonic()-started
-            self.phase = "processing"
+            with self.active_lock:
+                self.cycle['total'] = len(pending)
+            if pending:
+                LOG.info('开始处理本轮 %s 个文件，并发文件=%s 解析进程=%s',
+                         len(pending), self.settings.download_workers, self.settings.parser_workers)
+            self.set_phase('processing')
             if pending and not self.cancel.is_set():
                 self.ensure_parser_pool()
                 rows = iter(pending)
@@ -285,19 +386,30 @@ class Ingestor:
                         submit_next()
                     while inflight:
                         completed, _ = wait(inflight, timeout=.1, return_when=FIRST_COMPLETED)
+                        self.drain_parser_progress()
+                        self.warn_stalled()
                         if self.cancel.is_set() and self.parser_cancel is not None:
                             self.parser_cancel.set()
                         for future in completed:
                             row = inflight.pop(future)
+                            outcome, error = 'done', None
                             try:
                                 done += int(future.result())
                             except InterruptedError:
-                                pass
+                                outcome = 'cancelled'
                             except Exception as exc:
+                                outcome, error = ('cancelled' if self.cancel.is_set() else 'failed'), str(exc)
                                 if not self.cancel.is_set():
                                     failed += 1
                                     self.store.mark_failed(row['kind'], row['file_ts'], exc)
                                     LOG.warning('批次失败 %s %s: %s', row['kind'], row['file_ts'], exc)
+                            with self.active_lock:
+                                self.cycle['completed'] += 1
+                                self.cycle[{'done':'succeeded','failed':'failed','cancelled':'cancelled'}[outcome]] += 1
+                                self.last_completed = time.monotonic()
+                                self.recent_files.appendleft({'kind':row['kind'], 'file_ts':row['file_ts'],
+                                    'filename':file_url(row['kind'], row['file_ts']).rsplit('/', 1)[1],
+                                    'outcome':outcome, 'error':error, 'finished_at':time.time()})
                             submit_next()
             if done:
                 self.store.set_state("last_ingest_at", utcnow().isoformat())
@@ -313,6 +425,8 @@ class Ingestor:
                       "publishing_seconds": round(publishing_seconds, 3),
                       "stage_seconds": {key: round(value, 3) for key, value in self.timings.items()}}
             self.store.set_state("last_run", result)
+            if pending:
+                LOG.info('本轮结束：成功=%s 失败=%s 耗时=%.2fs', done, failed, elapsed)
             self.store.set_state("last_error", None)
             return result
         except Exception as exc:
@@ -322,14 +436,24 @@ class Ingestor:
             if self.parser_broken:
                 self.parser_pool.shutdown(wait=True, cancel_futures=True)
                 self.parser_pool = self.parser_cancel = None
+                self.close_progress_queue()
                 self.parser_broken = False
-            self.phase, self.current_file = "idle", None
+            self.set_phase('idle')
+            self.current_file = None
             self.busy.release()
+
+    def close_progress_queue(self):
+        with self.progress_lock:
+            if self.parser_progress is not None:
+                self.parser_progress.close()
+                self.parser_progress.join_thread()
+                self.parser_progress = None
 
     def close(self):
         self.stop()
         if self.parser_pool is not None:
             self.parser_pool.shutdown(wait=True, cancel_futures=True)
             self.parser_pool = None
+        self.close_progress_queue()
         if self.owns_client:
             self.client.close()

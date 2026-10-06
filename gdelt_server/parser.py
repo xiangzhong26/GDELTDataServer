@@ -5,6 +5,7 @@ import io
 import math
 import re
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,7 +95,7 @@ def validate_archive(archive, max_mb):
         raise ValueError("解压大小超过上限")
 
 
-def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None) -> Parsed:
+def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None, progress=None) -> Parsed:
     """
     解析一个 export.CSV.zip，直接产出聚合桶。
 
@@ -103,6 +104,7 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, c
     rel: dict[tuple, dict] = {}
     geo: dict[tuple, dict] = {}
     rows = skipped = 0
+    last_report = 0.
 
     def rel_cell(key):
         cell = rel.get(key)
@@ -140,6 +142,9 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, c
                 if len(fields) not in (58, 61):
                     raise ValueError(f"未知Events列布局：{len(fields)}列")
                 rows += 1
+                if progress and rows % 256 == 1 and time.monotonic()-last_report >= 1:
+                    progress(rows)
+                    last_report = time.monotonic()
                 # GDELT 2.0 当前导出是 61 列（ActionGeo 含三个 ADM2 字段），
                 # 旧编码本是 58 列。两种都支持。
                 if len(fields) >= 61:
@@ -211,12 +216,15 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, c
                     if quad_key:
                         c[quad_key] += 1
 
+    if progress:
+        progress(rows)
     return Parsed({"agg_relation": rel, "agg_geo": geo}, rows, skipped)
 
 
-def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None) -> Parsed:
+def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None, progress=None) -> Parsed:
     buckets: dict[tuple, dict] = {}
     rows = skipped = 0
+    last_report = 0.
 
     def cell(key):
         c = buckets.get(key)
@@ -243,6 +251,9 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
                 if len(fields) < 27:
                     raise ValueError(f"未知GKG列布局：{len(fields)}列")
                 rows += 1
+                if progress and rows % 256 == 1 and time.monotonic()-last_report >= 1:
+                    progress(rows)
+                    last_report = time.monotonic()
                 ts = file_ts
                 bucket = bucket_of(ts, "hour")
 
@@ -278,4 +289,6 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
                     c["china_business_docs"] += china
                     c["sum_tone"] += tone
                     c["sum_polarity"] += polarity
+    if progress:
+        progress(rows)
     return Parsed({"agg_gkg": buckets}, rows, skipped)

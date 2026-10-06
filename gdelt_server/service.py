@@ -51,6 +51,7 @@ class Service:
             self.job = None
         self.last_job = None
         self.last_export = 0.
+        self.next_run_at = None
         self.thread = threading.Thread(target=self.loop, name="gdelt-worker", daemon=True)
         self.ingestor.on_update = self.maybe_export
 
@@ -193,8 +194,16 @@ class Service:
             self.wake.set()
 
     def export_locked(self):
-        self.ingestor.check_disk()
-        manifest = self.snapshots.publish(build_snapshot(self.store, self.settings.snapshot_days))
+        previous = self.ingestor.phase
+        self.ingestor.set_phase('exporting')
+        started = time.monotonic()
+        LOG.info('开始计算并发布结果快照')
+        try:
+            self.ingestor.check_disk()
+            manifest = self.snapshots.publish(build_snapshot(self.store, self.settings.snapshot_days))
+            LOG.info('结果快照发布完成，耗时=%.2fs', time.monotonic()-started)
+        finally:
+            self.ingestor.set_phase(previous)
         self.store.set_state("snapshot_dirty", False)
         self.store.set_state('last_error', None)
         self.runtime_error = None
@@ -207,7 +216,6 @@ class Service:
         backlog = bool(self.store.pending(1))
         if (self.store.get_state("snapshot_dirty", False) and
                 (not backlog or time.monotonic()-self.last_export >= self.settings.poll_seconds)):
-            self.ingestor.phase = "exporting"
             self.export_locked()
 
     def loop(self):
@@ -215,6 +223,7 @@ class Service:
         while not self.shutdown.is_set():
             self.wake.wait(delay)
             self.wake.clear()
+            self.next_run_at = None
             if self.shutdown.is_set():
                 break
             with self.control:
@@ -231,7 +240,11 @@ class Service:
                         job['scheduled_files'] = self.ingestor.repair_gaps()
                         job['seeded'] = True
                     if job and job["action"] == "backfill" and not job.get("seeded") and not job.get('paused'):
-                        job["scheduled_files"] = self.ingestor.backfill(job["hours"], job.get("start_ts"), job.get('end_ts'))
+                        self.ingestor.set_phase('seeding')
+                        try:
+                            job["scheduled_files"] = self.ingestor.backfill(job["hours"], job.get("start_ts"), job.get('end_ts'))
+                        finally:
+                            self.ingestor.set_phase('idle')
                         job["seeded"] = True
                         self.store.set_state("active_backfill", job)
                     with self.control:
@@ -270,6 +283,7 @@ class Service:
                 LOG.exception('后台状态读取失败')
                 self.record_error(exc)
                 delay = 10
+            self.next_run_at = time.time()+delay if self.enabled or self.job else None
 
     def record_error(self, exc):
         code = getattr(exc, 'sqlite_errorname', '')
@@ -310,7 +324,23 @@ class Service:
         self.ingestor.close()
 
     def status(self):
+        job = dict(self.job or self.paused_backfill or
+                   (self.last_job if self.last_job and self.last_job.get('action') == 'backfill' else {}) or {})
+        progress = None
+        if job.get('action') == 'backfill':
+            start, end = job['start_ts'], job['end_ts']
+            total = max(0, (end-start)//SLOT*2)
+            with self.store.connect() as db:
+                counts = {r['status']:r['n'] for r in db.execute(
+                    'SELECT status,COUNT(*) n FROM ingest_file WHERE file_ts>=? AND file_ts<? GROUP BY status', (start, end))}
+            done = counts.get('done', 0)
+            progress = {'start_ts':start, 'end_ts':end, 'total':total, 'done':done,
+                        'pending':counts.get('pending', 0), 'failed':counts.get('failed', 0),
+                        'unseeded':max(0, total-sum(counts.values())),
+                        'percent':round(done/total*100, 2) if total else 100,
+                        'paused':bool(job.get('paused'))}
         return {"monitor_enabled": self.enabled, "running": self.enabled and self.thread.is_alive(),
+                "progress": progress, "next_run_at": self.next_run_at,
                 "phase": self.ingestor.phase, "busy": self.ingestor.busy.locked(),
                 "current_file": self.ingestor.current_file, "job": self.job, "last_job": self.last_job,
                 "concurrency": self.ingestor.concurrency_status(),

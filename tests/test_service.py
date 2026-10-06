@@ -35,6 +35,8 @@ def test_manual_backfill_continues_across_batches_and_restart(tmp_path,monkeypat
         assert len(processed)==8
         assert status['snapshot'] is not None
         assert not status['monitor_enabled']
+        assert status['progress']['percent'] == 100
+        assert status['progress']['done'] == status['progress']['total'] == 8
     with TestClient(create_app(settings)) as client:
         assert not client.get('/api/gdelt/status').json()['monitor_enabled']
         assert client.post('/api/admin/backfill',json={'hours':1}).json()['accepted']
