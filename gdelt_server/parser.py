@@ -83,6 +83,7 @@ class Parsed:
     tables: dict
     rows: int
     skipped: int = 0
+    parse_seconds: float = 0.
 
 
 def validate_archive(archive, max_mb):

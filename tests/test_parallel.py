@@ -107,7 +107,7 @@ def test_parser_cancellation_is_cooperative(tmp_path, recent_ts, parser, row):
         parser(path, recent_ts, cancel=cancel)
 
 
-@pytest.mark.parametrize('config', [{'download_workers': 0}, {'download_workers': 9}, {'parser_workers': 0}, {'parser_workers': 5}])
+@pytest.mark.parametrize('config', [{'download_workers': 0}, {'download_workers': 33}, {'parser_workers': 0}, {'parser_workers': 9}])
 def test_concurrency_limits(config):
     with pytest.raises(ValueError):
         Settings(**config)
@@ -218,3 +218,34 @@ def test_crashed_parser_pool_recreated_on_retry(store, tmp_path, recent_ts):
         assert not list(ingest.temp_dir.glob('*.zip'))
     finally:
         ingest.close(); client.close()
+
+
+def test_sixteen_download_tasks_and_stage_timings(store, tmp_path, recent_ts):
+    gate = threading.Barrier(16)
+    store.enqueue(recent_ts, recent_ts+8*SLOT)
+    def handler(request):
+        gate.wait(timeout=15)
+        return httpx.Response(200, content=zipped([gkg_row()] if '.gkg.' in str(request.url) else [event_row()]))
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    ingest = Ingestor(store, Settings(data_dir=tmp_path, min_free_gb=.1), client)
+    try:
+        assert ingest.settings.download_workers == 16 and ingest.settings.parser_workers == 4
+        result = ingest.run_once(schedule=False, limit=16)
+        assert result['processed'] == 16 and result['failed'] == 0
+        for stage in ('download', 'parse_compute', 'parse_pipeline', 'commit'):
+            assert result['stage_seconds'][stage] > 0
+        assert result['stage_seconds']['parse_queue_transfer'] >= 0
+        assert result['scheduling_seconds'] >= 0
+        assert not list(ingest.temp_dir.glob('*.zip'))
+    finally:
+        ingest.close(); client.close()
+
+
+def test_old_configuration_uses_new_defaults_but_explicit_limits_are_respected(tmp_path):
+    import json
+    config = tmp_path/'config.json'
+    config.write_text(json.dumps({'data_dir': './data'}))
+    assert Settings.load(config).download_workers == 16
+    config.write_text(json.dumps({'download_workers': 4, 'parser_workers': 2}))
+    assert Settings.load(config).download_workers == 4
+    assert Settings.load(config).parser_workers == 2

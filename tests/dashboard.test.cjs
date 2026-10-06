@@ -43,6 +43,10 @@ vm.runInContext(`
   vm.runInContext('server.data_version=1', context);
   await interval();
   assert.equal(vm.runInContext('loads', context), 2, 'New background data should refresh an empty page');
+  vm.runInContext(`server.concurrency={download_workers:16,parser_workers:4};server.last_run={processed:24,seconds:4.95,files_per_second:4.85,scheduling_seconds:.005,publishing_seconds:0,stage_seconds:{download:44,parse_compute:4,parse_queue_transfer:2,commit_wait:1,commit:1}}`, context);
+  await interval();
+  assert.match(element('performance').textContent, /16 个文件任务 \/ 4 个解析进程/);
+  assert.match(element('performance').textContent, /解析排队\/传输/);
   element('view').onchange();
   element('days').onchange();
   element('refresh').onclick();

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
 import logging
@@ -30,7 +31,10 @@ def _init_parser(cancel):
 
 def _parse_file(kind, path, ts, max_mb):
     parser = parse_gkg if kind == 'gkg' else parse_events
-    return parser(path, ts, max_mb, cancel=_PARSER_CANCEL)
+    started = time.monotonic()
+    parsed = parser(path, ts, max_mb, cancel=_PARSER_CANCEL)
+    parsed.parse_seconds = time.monotonic()-started
+    return parsed
 
 
 def file_url(kind, ts):
@@ -61,6 +65,22 @@ class Ingestor:
         self.parser_pool = None
         self.parser_cancel = None
         self.parser_broken = False
+        self.timings = {}
+
+    def record_timing(self, stage, elapsed):
+        with self.active_lock:
+            self.timings[stage] = self.timings.get(stage, 0.)+elapsed
+
+    @contextmanager
+    def stage(self, kind, ts, name):
+        with self.active_lock:
+            if (kind, ts) in self.active:
+                self.active[(kind, ts)]['stage'] = name
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.record_timing(name, time.monotonic()-started)
 
     def ensure_parser_pool(self):
         if self.settings.parser_workers > 1 and self.parser_pool is None:
@@ -79,11 +99,11 @@ class Ingestor:
         with self.active_lock:
             return {'download_workers': self.settings.download_workers,
                     'parser_workers': self.settings.parser_workers,
-                    'active_files': list(self.active.values())}
+                    'active_files': [dict(row) for row in self.active.values()]}
 
     def tracked_process(self, kind, ts):
         with self.active_lock:
-            self.active[(kind, ts)] = {'kind': kind, 'file_ts': ts}
+            self.active[(kind, ts)] = {'kind': kind, 'file_ts': ts, 'stage': 'starting'}
             self.current_file = next(iter(self.active.values()))
         try:
             if self.cancel.is_set():
@@ -157,7 +177,7 @@ class Ingestor:
             raise ValueError("批次已超出保留期，请先扩大日保留期")
         path = None
         try:
-            with tempfile.NamedTemporaryFile(prefix="gdelt-", suffix=".zip", dir=self.temp_dir, delete=False) as f:
+            with self.stage(kind, ts, 'download'), tempfile.NamedTemporaryFile(prefix="gdelt-", suffix=".zip", dir=self.temp_dir, delete=False) as f:
                 path = Path(f.name)
                 size = 0
                 with self.client.stream("GET", file_url(kind, ts)) as response:
@@ -170,30 +190,40 @@ class Ingestor:
                             raise ValueError("下载文件超过单文件大小上限")
                         f.write(block)
             parser = parse_gkg if kind == "gkg" else parse_events
-            if self.parser_pool is None:
-                parsed = parser(path, ts, self.settings.max_uncompressed_mb, cancel=self.cancel)
-            else:
-                try:
-                    future = self.parser_pool.submit(_parse_file, kind, path, ts, self.settings.max_uncompressed_mb)
-                    # Keep the ZIP until the parser finishes, including during cancellation.
-                    while not future.done():
-                        wait((future,), timeout=.05)
-                        if self.cancel.is_set():
-                            self.parser_cancel.set()
-                            future.cancel()
-                    if future.cancelled():
-                        raise InterruptedError('同步已停止')
-                    parsed = future.result()
-                except BrokenProcessPool:
-                    self.parser_broken = True
-                    raise
+            parse_started = time.monotonic()
+            with self.stage(kind, ts, 'parse_pipeline'):
+                if self.parser_pool is None:
+                    parsed = parser(path, ts, self.settings.max_uncompressed_mb, cancel=self.cancel)
+                    parsed.parse_seconds = time.monotonic()-parse_started
+                else:
+                    try:
+                        future = self.parser_pool.submit(_parse_file, kind, path, ts, self.settings.max_uncompressed_mb)
+                        # Keep the ZIP until the parser finishes, including during cancellation.
+                        while not future.done():
+                            wait((future,), timeout=.05)
+                            if self.cancel.is_set():
+                                self.parser_cancel.set()
+                                future.cancel()
+                        if future.cancelled():
+                            raise InterruptedError('同步已停止')
+                        parsed = future.result()
+                    except BrokenProcessPool:
+                        self.parser_broken = True
+                        raise
+            self.record_timing('parse_compute', parsed.parse_seconds)
+            self.record_timing('parse_queue_transfer', max(0., time.monotonic()-parse_started-parsed.parse_seconds))
             if parsed.rows == 0:
                 raise ValueError("文件没有可解析数据行，不标记为完成")
-            with self.write_lock:
+            with self.stage(kind, ts, 'commit_wait'):
+                self.write_lock.acquire()
+            try:
                 if self.cancel.is_set():
                     raise InterruptedError("同步已停止")
-                self.check_disk()
-                return self.store.apply(kind, ts, parsed.tables, parsed.rows, parsed.skipped)
+                with self.stage(kind, ts, 'commit'):
+                    self.check_disk()
+                    return self.store.apply(kind, ts, parsed.tables, parsed.rows, parsed.skipped)
+            finally:
+                self.write_lock.release()
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)
@@ -204,6 +234,8 @@ class Ingestor:
         done = failed = 0
         started = time.monotonic()
         try:
+            with self.active_lock:
+                self.timings = {}
             if clear_cancel:
                 self.cancel.clear()
             self.phase = "scheduling"
@@ -215,6 +247,7 @@ class Ingestor:
             self.check_disk()
             pending = self.store.pending(limit or self.settings.batch_files, ranges=ranges,
                                          exclude_range=exclude_range, descending=descending)
+            scheduling_seconds = time.monotonic()-started
             self.phase = "processing"
             if pending and not self.cancel.is_set():
                 self.ensure_parser_pool()
@@ -250,11 +283,16 @@ class Ingestor:
             if done:
                 self.store.set_state("last_ingest_at", utcnow().isoformat())
                 self.store.set_state("snapshot_dirty", True)
+            publish_started = time.monotonic()
             if self.on_update:
                 self.on_update()
+            publishing_seconds = time.monotonic()-publish_started
             elapsed = time.monotonic()-started
             result = {"processed": done, "failed": failed, "queued": len(pending),
-                      "seconds": round(elapsed, 2), "files_per_second": round(done/max(elapsed, .001), 2)}
+                      "seconds": round(elapsed, 2), "files_per_second": round(done/max(elapsed, .001), 2),
+                      "scheduling_seconds": round(scheduling_seconds, 3),
+                      "publishing_seconds": round(publishing_seconds, 3),
+                      "stage_seconds": {key: round(value, 3) for key, value in self.timings.items()}}
             self.store.set_state("last_run", result)
             self.store.set_state("last_error", None)
             return result
