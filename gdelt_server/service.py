@@ -126,19 +126,16 @@ class Service:
         return {'accepted': True, 'job': self.job}
 
     def work_options(self, job=None):
-        horizon = int(utcnow().timestamp())//SLOT*SLOT
         if job and job['action'] == 'backfill':
-            ranges = [(job['start_ts'], job['end_ts'])]
-            if self.enabled:
-                ranges.append((self.store.get_state('incremental_start', horizon-self.settings.initial_hours*3600), None))
-            return {'ranges': ranges, 'descending': True}
+            opts = {'descending': True}
+            if not self.enabled:
+                opts['ranges'] = [(job['start_ts'], job['end_ts'])]
+            return opts
         if self.paused_backfill:
             opts = {'exclude_range': (self.paused_backfill['start_ts'], self.paused_backfill['end_ts'])}
-            if self.enabled:
-                opts['ranges'] = [(self.store.get_state('incremental_start', horizon-self.settings.initial_hours*3600), None)]
             return opts
-        if self.enabled and not (job and job['action'] == 'retry'):
-            return {'ranges': [(self.store.get_state('incremental_start', horizon-self.settings.initial_hours*3600), None)]}
+        # Monitoring drains all outstanding batches, including older failures.
+        # Only an explicitly paused historical range is excluded.
         return {}
 
     def monitor(self, enabled):
@@ -185,6 +182,9 @@ class Service:
                     with self.ingestor.busy:
                         result = self.export_locked()
                 elif enabled or job:
+                    if job and job['action'] == 'retry' and not job.get('seeded'):
+                        job['scheduled_files'] = self.ingestor.repair_gaps()
+                        job['seeded'] = True
                     if job and job["action"] == "backfill" and not job.get("seeded") and not job.get('paused'):
                         job["scheduled_files"] = self.ingestor.backfill(job["hours"], job.get("start_ts"), job.get('end_ts'))
                         job["seeded"] = True

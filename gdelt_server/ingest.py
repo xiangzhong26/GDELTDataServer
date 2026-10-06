@@ -11,7 +11,7 @@ import httpx
 
 from .config import Settings
 from .parser import parse_events, parse_gkg
-from .store import Store, DAY, SLOT, utcnow
+from .store import Store, DAY, SLOT, bucket_of, utcnow
 
 LOG = logging.getLogger(__name__)
 BASE = "https://data.gdeltproject.org/gdeltv2"
@@ -79,6 +79,15 @@ class Ingestor:
         # At most one day of pending rows is seeded per pass; cursor persists progress.
         end = min(horizon, start + DAY)
         return self.store.enqueue(start, end, cursor=end)
+
+    def repair_gaps(self, now=None):
+        """Requeue missing slots inside known history, retaining completed batches."""
+        horizon = int(now if now is not None else utcnow().timestamp())//SLOT*SLOT
+        oldest = bucket_of(horizon, 'day')-self.settings.day_retention_days*DAY
+        with self.store.connect() as db:
+            first = db.execute("SELECT MIN(file_ts) FROM ingest_file WHERE file_ts>=? AND file_ts<?",
+                               (oldest, horizon)).fetchone()[0]
+        return self.store.enqueue(first, horizon) if first is not None else 0
 
     def backfill(self, hours, start_ts=None, end_ts=None):
         if hours < 1 or hours > self.settings.day_retention_days * 24:

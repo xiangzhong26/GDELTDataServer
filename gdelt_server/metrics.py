@@ -215,9 +215,9 @@ class Window:
         return HOUR if self.series == "hour" else DAY
 
 
-def make_window(days: int) -> Window:
+def make_window(days: int, now=None) -> Window:
     days = max(1, min(int(days), 730))
-    now = int(utcnow().timestamp())
+    now = int((now if now is not None else utcnow()).timestamp())
     # ≤7 天用小时级（趋势图要看得出日内波动），更长一律用日级聚合：
     # 365 天如果走小时档，要扫 8760 × 国家数 × 大类数 行。
     gran = "hour" if days <= 7 else "day"
@@ -408,6 +408,18 @@ class BaseMetrics:
     def __init__(self, store: Store):
         self.store = store
 
+    def now(self):
+        return self.store.read_time if hasattr(self.store, 'read_time') else utcnow()
+
+    def window(self, days):
+        return make_window(days, self.now())
+
+    @staticmethod
+    def momentum_window(win):
+        # Momentum compares whole UTC days, independently of the hourly chart window.
+        return Window(win.days, 'day', 'day', bucket_of(win.start, 'day'),
+                      bucket_of(win.end, 'day'))
+
     def params(self) -> Params:
         return Params.load(self.store)
 
@@ -457,7 +469,7 @@ class BaseMetrics:
 
     def attitude(self, days: int = 30, country: str = "USA") -> dict[str, Any]:
         p = self.params()
-        win = make_window(days)
+        win = self.window(days)
         country = (country or "USA").upper()
         base = "actor2='CHN' AND actor1<>'CHN'"
         by_country = {r["actor1"]: r for r in self._agg(
@@ -518,7 +530,7 @@ class BaseMetrics:
             key=lambda r: r["count"], reverse=True)
 
         return {
-            "generated_at": utcnow().isoformat(timespec="seconds"),
+            "generated_at": self.now().isoformat(timespec="seconds"),
             "window": {"days": win.days, "granularity": win.series},
             "countries": countries,
             "selected": next((r for r in countries if r["code"] == country), None),
@@ -536,7 +548,7 @@ class BaseMetrics:
 
     def country_risk(self, days: int = 30, country: str = "US") -> dict[str, Any]:
         p = self.params()
-        win = make_window(days)
+        win = self.window(days)
         country = (country or "US").upper()
         def _in(codes) -> str:
             # root_code 是我们自己生成的两位数字串，但仍然走参数化，
@@ -560,7 +572,7 @@ class BaseMetrics:
         # 动量只需要「国家 × 自然日」的事件数，不必把明细拉出来
         daily: dict[str, dict[int, float]] = {}
         for r in self._agg("agg_geo", "SUM(n_events) n_events",
-                           f"geo_country, bucket - bucket % {DAY}", win,
+                           f"geo_country, bucket - bucket % {DAY}", self.momentum_window(win),
                            select_extra=f"bucket - bucket % {DAY} AS day"):
             daily.setdefault(r["geo_country"], {})[r["day"]] = r["n_events"]
 
@@ -578,7 +590,7 @@ class BaseMetrics:
                 "conflict": int(r["conflict"] or 0),
                 "sum_tone": r["sum_tone"] or 0.0}
 
-        today = bucket_of(int(utcnow().timestamp()), "day")
+        today = bucket_of(int(self.now().timestamp()), "day")
 
         out = []
         for code, a in agg.items():
@@ -622,7 +634,7 @@ class BaseMetrics:
                                "avg_tone": None})
 
         return {
-            "generated_at": utcnow().isoformat(timespec="seconds"),
+            "generated_at": self.now().isoformat(timespec="seconds"),
             "window": {"days": win.days, "granularity": win.series},
             "countries": out,
             "selected": next((r for r in out if r["code"] == country), None),
@@ -660,7 +672,7 @@ class BaseMetrics:
 
     def enterprise_risk(self, days: int = 30, country: str = "US") -> dict[str, Any]:
         p = self.params()
-        win = make_window(days)
+        win = self.window(days)
         country = (country or "US").upper()
         agg = {r["country"]: r for r in self._agg(
             "agg_gkg", self._GKG_SUMS, "country", win)
@@ -726,7 +738,7 @@ class BaseMetrics:
                                **{f"{f}_docs": 0 for f in self.ER_FIELDS}})
 
         return {
-            "generated_at": utcnow().isoformat(timespec="seconds"),
+            "generated_at": self.now().isoformat(timespec="seconds"),
             "window": {"days": win.days, "granularity": win.series},
             "countries": out,
             "selected": next((r for r in out if r["code"] == country), None),
@@ -743,7 +755,7 @@ class BaseMetrics:
     def overview(self, days: int = 7, view: str = "china",
                  country: str = "USA") -> dict[str, Any]:
         p = self.params()
-        win = make_window(days)
+        win = self.window(days)
         country = (country or "USA").upper()
 
         if view == "china":
@@ -814,7 +826,7 @@ class BaseMetrics:
             key=lambda r: r["count"], reverse=True)[:12]
 
         return {
-            "generated_at": utcnow().isoformat(timespec="seconds"),
+            "generated_at": self.now().isoformat(timespec="seconds"),
             "window": {"days": win.days, "granularity": win.series},
             "view": {"mode": view, "country": "CHN" if view == "china" else country,
                      "country_name": "中国" if view == "china" else country_label(country),
@@ -855,7 +867,7 @@ class BaseMetrics:
         out: dict[str, Any] = {
             "data_source": "GDELT 2.0（Events + GKG），每 15 分钟更新",
             "window_days": days,
-            "generated_at": utcnow().isoformat(timespec="seconds"),
+            "generated_at": self.now().isoformat(timespec="seconds"),
             "note": "以下全部为聚合统计量，不含任何新闻原文、标题、机构名或链接。",
             "country_risk_top": slim_rank(
                 cr["countries"], ("code", "name", "risk_score", "risk_level",
@@ -981,7 +993,7 @@ class Metrics(BaseMetrics):
         return clamp(50 + p.momentum_sensitivity*(recent_avg/base_avg-1))
 
     def decorate(self, result, days, source, fields):
-        win = make_window(days)
+        win = self.window(days)
         coverage = self.store.coverage(source, win.start, win.end)
         buckets = self.store.coverage_buckets(source, win.start, win.end, win.size)
         result["coverage"] = coverage
@@ -1013,14 +1025,14 @@ class Metrics(BaseMetrics):
     def country_risk(self, days=30, country="US"):
         self._query_version = self.store.get_state('data_version', 0)
         self._momentum_coverage = {}
-        self._momentum_window_start = bucket_of(make_window(days).start, "day")
+        self._momentum_window_start = bucket_of(self.window(days).start, "day")
         result = super().country_risk(days, country)
-        win, p = make_window(days), self.params()
+        win, p = self.window(days), self.params()
         daily = {}
-        for r in self._agg("agg_geo", "SUM(n_events) n_events", f"geo_country, bucket-bucket%{DAY}", win,
+        for r in self._agg("agg_geo", "SUM(n_events) n_events", f"geo_country, bucket-bucket%{DAY}", self.momentum_window(win),
                            select_extra=f"bucket-bucket%{DAY} AS day"):
             daily.setdefault(r["geo_country"], {})[r["day"]] = r["n_events"]
-        today = bucket_of(int(utcnow().timestamp()), "day")
+        today = bucket_of(int(self.now().timestamp()), "day")
         for row in result["countries"]:
             row["momentum_available"] = self.momentum_value(daily.get(row["code"], {}), today, p) is not None
         result["minimum_events"] = p.min_events

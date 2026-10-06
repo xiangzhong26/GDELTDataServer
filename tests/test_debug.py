@@ -75,7 +75,7 @@ def test_manual_retry_and_backfill_wait_for_delayed_failure(tmp_path,monkeypatch
     service.start()
     try:
         wait_until(lambda:service.job is None)
-        assert service.store.stats()['ledger']=={'done':1}
+        assert service.store.stats()['ledger']=={'done':2}  # Missing companion is repaired too.
         assert not service.enabled
     finally:
         service.close()
@@ -144,15 +144,15 @@ def test_query_read_snapshot_is_consistent_while_ingest_writes(store):
     assert store.get_state('data_version') == 2
 
 
-def test_expanded_retention_requeues_expired_files_without_reimporting_done(store):
+def test_expanded_retention_requeues_only_fully_pruned_files(store):
     from gdelt_server.store import DAY, bucket_of
     old = bucket_of(int(utcnow().timestamp()), 'day')-731*DAY
     store.enqueue(old, old+SLOT)
     store.apply('events', old, {}, 1)
     store.prune()
-    assert store.stats()['ledger'] == {'done': 1, 'expired': 1}
-    assert store.enqueue(old, old+SLOT) == 1
-    assert store.pending(10)[0]['kind'] == 'gkg'
+    assert store.stats()['ledger'] == {'expired': 2}
+    assert store.enqueue(old, old+SLOT) == 2
+    assert store.apply('events', old, {}, 1)
     assert not store.apply('events', old, {}, 1)
 
 

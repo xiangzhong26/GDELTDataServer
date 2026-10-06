@@ -63,13 +63,15 @@ def test_invalid_numeric_parser_data_never_publishes(tmp_path):
     with pytest.raises(ValueError):parse_gkg(path,ts)
 
 
-def test_pending_expiration_keeps_completed_history_ledger(store):
+def test_expiration_keeps_compact_ledger_for_fully_pruned_history(store):
     from gdelt_server.store import DAY,bucket_of
     old=bucket_of(int(utcnow().timestamp()),'day')-731*DAY
     store.enqueue(old,old+SLOT)
     store.apply('events',old,{},1)
     store.prune()
-    assert store.stats()['ledger']=={'done':1,'expired':1}
+    assert store.stats()['ledger']=={'expired':2}
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM ingest_file').fetchone()[0] == 2
     assert store.pending(20)==[]
 
 

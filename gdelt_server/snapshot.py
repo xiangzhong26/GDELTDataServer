@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import uuid
 
-from .metrics import Metrics, metric_catalog, make_window, _fill_series, _iso, _safe_div
+from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div
 from .store import Store, DAY, utcnow
 
 SCHEMA_VERSION = 1
@@ -20,7 +20,7 @@ def encode_json(value):
 
 def all_series(metrics, days, view):
     """One grouped scan per view; do not recalculate each country's full ranking."""
-    win, p = make_window(days), metrics.params()
+    win, p = metrics.window(days), metrics.params()
     if view == "attitude":
         table, group, sums = "agg_relation", "actor1,bucket", metrics._REL_SUMS
         where = "actor2='CHN' AND actor1<>'CHN'"
@@ -74,7 +74,7 @@ def all_series(metrics, days, view):
 
 def all_event_types(metrics, days):
     from .metrics import CAMEO_ROOT_LABELS
-    rows = metrics._agg("agg_relation", metrics._REL_SUMS, "actor1,root_code", make_window(days),
+    rows = metrics._agg("agg_relation", metrics._REL_SUMS, "actor1,root_code", metrics.window(days),
                         "actor2='CHN' AND actor1<>'CHN'")
     result = {}
     for r in rows:
@@ -88,6 +88,12 @@ def all_event_types(metrics, days):
 
 
 def build_snapshot(store: Store, ranges):
+    # All views and metadata must describe the same committed database version.
+    with store.read_snapshot() as view:
+        return _build_snapshot(view, ranges)
+
+
+def _build_snapshot(store: Store, ranges):
     metrics = Metrics(store)
     views = {}
     for days in ranges:
@@ -108,7 +114,7 @@ def build_snapshot(store: Store, ranges):
                 if name == "attitude":
                     views[str(days)][name]["event_types_by_country"] = all_event_types(metrics, days)
     return {"schema_version": SCHEMA_VERSION, "snapshot_id": uuid.uuid4().hex,
-            "created_at": utcnow().isoformat(), "data_version": store.get_state("data_version", 0),
+            "created_at": metrics.now().isoformat(), "data_version": store.get_state("data_version", 0),
             "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v1",
             "params": metrics.params().as_dict(), "metrics": metric_catalog(metrics.params()),
             "codes": metrics.code_reference(), "views": views}

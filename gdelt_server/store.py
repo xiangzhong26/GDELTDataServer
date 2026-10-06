@@ -86,6 +86,7 @@ class Store:
             db.execute('BEGIN')
             view = copy(self)
             view._read_connection = db
+            view.read_time = utcnow()
             yield view
 
     def initialize(self):
@@ -243,7 +244,7 @@ class Store:
 
     def coverage_buckets(self, kind, start, end, step):
         """Only fully elapsed slots count; missing collection is distinct from zero."""
-        horizon = int(utcnow().timestamp()) // SLOT * SLOT
+        horizon = int((self.read_time if hasattr(self, 'read_time') else utcnow()).timestamp()) // SLOT * SLOT
         with self.connect() as db:
             rows = db.execute("SELECT file_ts-file_ts%? bucket,COUNT(*) n FROM ingest_file "
                               "WHERE kind=? AND status='done' AND file_ts>=? AND file_ts<? GROUP BY bucket",
@@ -278,9 +279,14 @@ class Store:
                 for gran, days in (("hour", hour_days), ("day", day_days)):
                     cursor = db.execute(f"DELETE FROM {table} WHERE granularity=? AND bucket<?", (gran, now-days*DAY))
                     deleted[f"{table}.{gran}"] = cursor.rowcount
-            # Keep the compact ledger: pruning it would permit reimport double counting.
+            # Only expire completed files after BOTH aggregate granularities are removed.
+            # Keeping 'done' would prevent safe restoration after retention is expanded.
             db.execute("UPDATE ingest_file SET status='expired',error='批次超出聚合保留期' "
-                       "WHERE status IN ('pending','failed') AND file_ts<?", (now-day_days*DAY,))
+                       "WHERE status IN ('pending','failed','done') AND file_ts<?", (now-max(hour_days, day_days)*DAY,))
+            if any(deleted.values()):
+                version = db.execute("SELECT value FROM gdelt_state WHERE key='data_version'").fetchone()
+                self._state(db, 'data_version', (json.loads(version[0]) if version else 0)+1)
+                self._state(db, 'snapshot_dirty', True)
         with self.connect() as db:
             db.execute("PRAGMA wal_checkpoint(PASSIVE)")
             db.execute("PRAGMA incremental_vacuum(2000)")
