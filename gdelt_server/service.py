@@ -54,7 +54,7 @@ class Service:
     def request(self, action, hours=None, start_date=None):
         with self.control:
             if self.job or self.ingestor.busy.locked():
-                if action == 'retry' and self.job and self.job['action'] == 'backfill' and not self.ingestor.busy.locked():
+                if action == 'retry' and self.job and self.job['action'] == 'backfill' and not self.job.get('paused'):
                     self.store.retry_failed()
                     self.wake.set()
                     return {'accepted': True, 'job': self.job}
@@ -240,7 +240,7 @@ class Service:
         opts = self.work_options(self.job)
         scope = {k:v for k,v in opts.items() if k != 'descending'}
         ready = self.store.pending(1, **opts)
-        delay = 2 if ((self.enabled or self.job) and ready) else self.settings.poll_seconds
+        delay = .1 if ((self.enabled or self.job) and ready) else self.settings.poll_seconds
         if (self.enabled or self.job) and self.store.has_unfinished(**scope):
             delay = min(delay, self.store.retry_delay(**scope))
         if self.enabled and not ready:
@@ -252,7 +252,7 @@ class Service:
                     self.record_error(exc)
         horizon = int(time.time())//900*900
         if self.enabled and self.store.get_state("scheduled_until", horizon) < horizon:
-            delay = 2
+            delay = min(delay, .1)
         return delay
 
     def close(self):
@@ -268,6 +268,8 @@ class Service:
         return {"monitor_enabled": self.enabled, "running": self.enabled and self.thread.is_alive(),
                 "phase": self.ingestor.phase, "busy": self.ingestor.busy.locked(),
                 "current_file": self.ingestor.current_file, "job": self.job, "last_job": self.last_job,
+                "concurrency": self.ingestor.concurrency_status(),
+                "last_run": self.store.get_state('last_run'),
                 "paused_backfill": self.paused_backfill,
                 "last_error": self.store.get_state("last_error") or self.runtime_error,
                 "worker_alive": self.thread.is_alive(),

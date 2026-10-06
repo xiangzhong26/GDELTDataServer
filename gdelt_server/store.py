@@ -240,6 +240,7 @@ class Store:
                        (kind, ts, rows, skipped, int(utcnow().timestamp())))
             version = db.execute("SELECT value FROM gdelt_state WHERE key='data_version'").fetchone()
             self._state(db, "data_version", (json.loads(version[0]) if version else 0) + 1)
+            self._state(db, 'snapshot_dirty', True)
         return True
 
     def coverage_buckets(self, kind, start, end, step):

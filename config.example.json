@@ -6,6 +6,8 @@
   "poll_seconds": 900,
   "initial_hours": 72,
   "batch_files": 32,
+  "download_workers": 4,
+  "parser_workers": 2,
   "hour_retention_days": 60,
   "day_retention_days": 730,
   "min_free_gb": 5,

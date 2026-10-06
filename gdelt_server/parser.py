@@ -93,7 +93,7 @@ def validate_archive(archive, max_mb):
         raise ValueError("解压大小超过上限")
 
 
-def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024) -> Parsed:
+def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None) -> Parsed:
     """
     解析一个 export.CSV.zip，直接产出聚合桶。
 
@@ -134,6 +134,8 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024) -
             wrapper = io.TextIOWrapper(stream, encoding="utf-8",
                                        errors="replace", newline="")
             for fields in csv.reader(wrapper, delimiter="\t"):
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError('解析已暂停，未提交批次保留待处理')
                 if len(fields) not in (58, 61):
                     raise ValueError(f"未知Events列布局：{len(fields)}列")
                 rows += 1
@@ -211,7 +213,7 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024) -
     return Parsed({"agg_relation": rel, "agg_geo": geo}, rows, skipped)
 
 
-def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024) -> Parsed:
+def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, cancel=None) -> Parsed:
     buckets: dict[tuple, dict] = {}
     rows = skipped = 0
 
@@ -235,6 +237,8 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024) -> P
             wrapper = io.TextIOWrapper(stream, encoding="utf-8",
                                        errors="replace", newline="")
             for fields in csv.reader(wrapper, delimiter="\t"):
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError('解析已暂停，未提交批次保留待处理')
                 if len(fields) < 27:
                     raise ValueError(f"未知GKG列布局：{len(fields)}列")
                 rows += 1
