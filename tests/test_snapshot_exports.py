@@ -178,3 +178,16 @@ def test_configure_sync_refuses_environment_credential_conflict(tmp_path, monkey
         main()
     assert exc.value.code == 2
     assert path.read_text() == '{}'
+
+
+def test_snapshot_exports_extra_daily_history_for_short_windows(store,monkeypatch):
+    import gdelt_server.snapshot as module
+    calls=[]
+    def series(metrics,days,name):
+        calls.append((days,name))
+        return {'USA':[{'bucket':0,'timestamp':'1970-01-01T00:00:00Z','complete':True,'event_count':2}]}
+    monkeypatch.setattr(module,'all_series',series)
+    snapshot=build_snapshot(store,[7,365])
+    assert (455,'attitude') in calls and (455,'country-risk') in calls and (455,'enterprise-risk') in calls
+    assert snapshot['trend_history']['overview_all'][0]['event_count']==2
+    assert snapshot['schema_version']==1

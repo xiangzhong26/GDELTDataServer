@@ -130,11 +130,27 @@ def _build_snapshot(store: Store, ranges):
                     c: series for c, series in views[str(days)][name]["series_by_country"].items() if c in allowed}
                 if name == "attitude":
                     views[str(days)][name]["event_types_by_country"] = all_event_types(metrics, days)
+    # 90 extra calendar days cover the moving-average lookback outside the longest view.
+    history_days = min(730, max(map(int, ranges)) + 90)
+    relation_history = all_series(metrics, history_days, 'attitude')
+    overview_points = {}
+    for points in relation_history.values():
+        for point in points:
+            bucket = point['bucket']
+            if bucket not in overview_points:
+                overview_points[bucket] = {"bucket": bucket, "timestamp": point['timestamp'],
+                    "complete": point['complete'], "event_count": 0 if point['event_count'] is not None else None}
+            if point['event_count'] is not None:
+                overview_points[bucket]['event_count'] += point['event_count']
+    trend_history = {'attitude': relation_history, 'overview': relation_history,
+        'overview_all': [overview_points[b] for b in sorted(overview_points)],
+        'country-risk': all_series(metrics, history_days, 'country-risk'),
+        'enterprise-risk': all_series(metrics, history_days, 'enterprise-risk')}
     return {"schema_version": SCHEMA_VERSION, "snapshot_id": uuid.uuid4().hex,
             "created_at": metrics.now().isoformat(), "data_version": store.get_state("data_version", 0),
             "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v1",
             "params": metrics.params().as_dict(), "metrics": metric_catalog(metrics.params()),
-            "codes": metrics.code_reference(), "views": views}
+            "codes": metrics.code_reference(), "views": views, "trend_history": trend_history}
 
 
 def validate_snapshot(data):
