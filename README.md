@@ -408,3 +408,27 @@ sudo systemctl stop gdelt-data-server && sudo git -C /opt/GDELTDataServer pull -
 私有仓库仍可能询问GitHub Token；一条命令不会绕过GitHub认证。服务器工作目录存在未提交或未跟踪内容、分支分叉时，脚本停止更新以保留内容，不执行reset或clean。获取更新在停止服务之前进行；后续安装、测试或健康检查失败时服务保持停止，并显示错误，修复后重跑命令。数据和本地配置保留，不自动创建可能占满磁盘的全量数据库副本，也不自动回退数据库。
 
 脚本检查了Bash语法，项目测试在Windows通过；完整systemd更新流程需在Ubuntu实际执行验证。
+
+### GitHub拉取出现GnuTLS recv error (-110)
+
+该错误表示TLS连接异常中断，可能与网络、代理或连接协议有关，不能仅凭错误确定具体原因。更新脚本使用HTTP/1.1并最多尝试3次，获取失败时不停止正在运行的服务。
+
+如果旧版首次引导命令已经停止服务而拉取失败，先恢复服务：
+
+```bash
+sudo systemctl start gdelt-data-server
+```
+
+然后仅获取远程提交，不更改正在运行的源码，尝试HTTP/1.1：
+
+```bash
+sudo git -c http.version=HTTP/1.1 -C /opt/GDELTDataServer fetch origin
+```
+
+fetch成功后再执行首次引导命令，pull也使用HTTP/1.1：
+
+```bash
+sudo systemctl stop gdelt-data-server && sudo git -c http.version=HTTP/1.1 -C /opt/GDELTDataServer pull --ff-only && bash /opt/GDELTDataServer/deploy/update.sh
+```
+
+若pull再次失败，恢复旧服务并继续排查连接。不要关闭SSL证书验证。持续失败时检查服务器访问GitHub的网络与代理；普通用户能连接但sudo不能连接时，核对sudo环境中的代理和Git配置差异。

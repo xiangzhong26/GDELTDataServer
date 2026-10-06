@@ -43,7 +43,21 @@ if [[ -z "$REMOTE" || "$REMOTE" == . ]]; then
 fi
 
 echo '1/6 从GitHub获取更新（服务此时仍在运行）…'
-git fetch "$REMOTE"
+FETCH_OK=0
+for attempt in 1 2 3; do
+  if git -c http.version=HTTP/1.1 fetch "$REMOTE"; then
+    FETCH_OK=1
+    break
+  fi
+  if [[ "$attempt" != 3 ]]; then
+    echo "GitHub获取失败，第 $attempt 次尝试；2秒后重试…" >&2
+    sleep 2
+  fi
+done
+if [[ "$FETCH_OK" != 1 ]]; then
+  echo 'GitHub获取失败，服务未被本脚本停止。请检查网络、代理和GitHub认证后重试。' >&2
+  exit 1
+fi
 if ! git merge-base --is-ancestor HEAD "$UPSTREAM"; then
   echo '服务器分支与远程分支分叉，无法安全快进；服务未停止，请先处理分支差异。' >&2
   exit 1
