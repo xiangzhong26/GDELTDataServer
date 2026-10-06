@@ -148,6 +148,17 @@ sudo systemctl start gdelt-data-server
 
 ## 给腾讯云提供结果
 
+frp 作为独立工具，需要手动执行；本项目的数据采集、回填和更新不会自动安装它。云端完成 `sudo python3 /opt/DSI/deploy/setup-frp.py cloud --public-ip 云端公网IP` 后，在安全组放行工具输出的实际连接端口（7000占用时可能为7001），然后在本地执行：
+
+```bash
+sudo python3 /opt/GDELTDataServer/deploy/setup-frp.py local
+```
+
+按隐藏提示输入云端 `/etc/dsi-frp/pairing.txt` 的完整配对码。脚本直接下载官方frp 0.71.0当前架构安装包，显示curl进度条并强制校验SHA256；下载连接限时15秒，单次180秒、最多重试2次，总限时600秒。网络过慢失败时可以重试，或用 `--archive /实际路径/官方Linux安装包.tar.gz` 手动提供包。项目不提交安装包。安装过程中不需要停止回填，既有已验证的二进制和配对会复用。
+
+检查 `sudo systemctl status dsi-frpc --no-pager` 和 `sudo journalctl -u dsi-frpc -n 30 --no-pager`，必须确认代理连接成功。DSI后台源地址填 `http://127.0.0.1:18810`，填写 `snapshot_read_token` 后保存、立即同步、开启结果同步。不要开放云端18810，不要用管理令牌或frp配对码替代快照只读令牌。完整云端步骤见DSI仓库的 `docs/gdelt-sync.md`。
+
+
 第一阶段只运行本地 `serve`，无需frp。计算结果可从下列接口拉取：
 
 - `GET /api/snapshots/latest`：当前快照版本、生成时间、压缩大小及SHA256。
