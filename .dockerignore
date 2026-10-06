@@ -1,0 +1,7 @@
+.venv
+data
+tests
+.pytest_cache
+__pycache__
+config.local.json
+*.zip

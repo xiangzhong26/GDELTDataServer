@@ -1,0 +1,18 @@
+{
+  "data_dir": "./data",
+  "host": "127.0.0.1",
+  "port": 8800,
+  "monitor_enabled": false,
+  "poll_seconds": 900,
+  "initial_hours": 72,
+  "batch_files": 32,
+  "hour_retention_days": 60,
+  "day_retention_days": 730,
+  "min_free_gb": 5,
+  "max_database_gb": 250,
+  "max_download_mb": 128,
+  "max_uncompressed_mb": 1024,
+  "request_timeout": 60,
+  "api_token": "",
+  "snapshot_days": [7, 30, 90, 365]
+}

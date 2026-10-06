@@ -1,0 +1,23 @@
+[Unit]
+Description=GDELT aggregate data server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gdelt
+Group=gdelt
+WorkingDirectory=/opt/GDELTDataServer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/GDELTDataServer/.venv/bin/python -m gdelt_server --config /opt/GDELTDataServer/config.local.json serve
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/GDELTDataServer/data
+
+[Install]
+WantedBy=multi-user.target
