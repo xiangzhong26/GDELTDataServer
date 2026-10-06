@@ -151,14 +151,14 @@ WantedBy=multi-user.target
 
 
 def download_archive(url,path):
-    print('连接 GitHub：连接超时15秒，每次下载最多180秒；失败最多重试2次。下方显示下载进度。',flush=True)
+    print('连接 GitHub：连接超时15秒；下载不限总时长，失败最多重试2次。下方显示进度，可按 Ctrl+C 取消。',flush=True)
     try:
         subprocess.run(['curl','--fail','--location','--progress-bar',
-            '--connect-timeout','15','--max-time','180','--max-filesize',str(100*1024**2),
-            '--retry','2','--retry-delay','2','--retry-all-errors','--retry-max-time','540',
-            '--output',str(path),url],check=True,timeout=600)
+            '--connect-timeout','15','--max-filesize',str(100*1024**2),
+            '--retry','2','--retry-delay','2','--retry-all-errors',
+            '--output',str(path),url],check=True)
     except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError) as exc:
-        raise RuntimeError('GitHub 下载失败或超时。可在其他电脑下载官方安装包，再用 --archive 指定文件；现有隧道未修改') from exc
+        raise RuntimeError('GitHub 下载失败。可在其他电脑下载官方安装包，再用 --archive 指定文件；现有隧道未修改') from exc
 
 
 def install_binary(binary,archive_source=None):

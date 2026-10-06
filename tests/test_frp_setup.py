@@ -83,18 +83,18 @@ def test_custom_control_port_is_transferred_in_pairing():
     assert tomllib.loads(frp.render_config('local',decoded))['serverPort']==7001
 
 
-def test_download_has_progress_and_hard_deadline(monkeypatch,tmp_path):
+def test_download_has_progress_without_total_deadline(monkeypatch,tmp_path):
     calls=[]
     monkeypatch.setattr(frp.subprocess,'run',lambda args,**kw:calls.append((args,kw)))
     frp.download_archive('https://github.com/example',tmp_path/'archive')
     args,opts=calls[0]
     assert '--progress-bar' in args and '--connect-timeout' in args
-    assert args[args.index('--max-time')+1]=='180'
-    assert opts['timeout']==600 and opts['check'] is True
+    assert '--max-time' not in args and '--retry-max-time' not in args
+    assert 'timeout' not in opts and opts['check'] is True
 
 
-def test_download_timeout_reports_offline_alternative(monkeypatch,tmp_path):
-    def fail(*a,**kw):raise subprocess.TimeoutExpired('curl',600)
+def test_download_failure_reports_offline_alternative(monkeypatch,tmp_path):
+    def fail(*a,**kw):raise subprocess.CalledProcessError(7,['curl'])
     monkeypatch.setattr(frp.subprocess,'run',fail)
     with pytest.raises(RuntimeError,match='--archive'):
         frp.download_archive('https://github.com/example',tmp_path/'archive')
