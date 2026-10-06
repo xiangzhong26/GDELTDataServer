@@ -31,6 +31,13 @@ class MonitorBody(BaseModel):
     enabled: bool
 
 
+class ConcurrencyBody(BaseModel):
+    download_workers: int = Field(ge=1, le=64, strict=True)
+    parser_workers: int = Field(ge=1, le=16, strict=True)
+
+    model_config = {'extra': 'forbid'}
+
+
 class BackfillBody(BaseModel):
     hours: int | None = Field(None, ge=1, le=87600)
     start_date: date | None = None
@@ -157,6 +164,14 @@ def create_app(settings=None):
     @app.post("/api/admin/sync", dependencies=protected)
     def sync():
         return app.state.service.request("sync")
+
+    @app.put('/api/admin/concurrency', dependencies=protected)
+    def concurrency(body: ConcurrencyBody):
+        return app.state.service.configure_concurrency(body.download_workers, body.parser_workers)
+
+    @app.post('/api/admin/pause', dependencies=protected)
+    def pause_all():
+        return app.state.service.pause_all()
 
     @app.post('/api/admin/retry', dependencies=protected)
     def retry():

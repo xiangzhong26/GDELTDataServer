@@ -23,6 +23,13 @@ class Service:
         self.runtime_error = None
         settings.day_retention_days = max(settings.day_retention_days,
                                           self.store.get_state("backfill_retention_days", 0))
+        saved = self.store.get_state('concurrency_settings')
+        if saved:
+            from .config import Settings
+            validated = Settings.model_validate({**settings.model_dump(), **saved})
+            settings.download_workers = validated.download_workers
+            settings.parser_workers = validated.parser_workers
+        self.pending_concurrency = None
         self.ingestor = Ingestor(self.store, settings)
         self.ingestor.cleanup_abandoned()
         self.snapshots = SnapshotFiles(settings.data_dir/"snapshots")
@@ -50,6 +57,43 @@ class Service:
     def start(self):
         self.thread.start()
         self.wake.set()
+
+    def configure_concurrency(self, download_workers, parser_workers):
+        from .config import Settings
+        desired = {'download_workers': download_workers, 'parser_workers': parser_workers}
+        Settings.model_validate({**self.settings.model_dump(), **desired})
+        with self.control:
+            self.store.set_state('concurrency_settings', desired)
+            self.pending_concurrency = desired
+            self.ingestor.reconfigure.set()
+            self.wake.set()
+        return {'accepted': True, 'requested': desired, 'reason': '并发设置已保存，在途文件收尾后生效，无需重启'}
+
+    def apply_pending_concurrency(self):
+        with self.ingestor.busy:
+            with self.control:
+                desired = self.pending_concurrency
+            if desired is not None:
+                # Pool shutdown must not hold the control lock needed by pause buttons.
+                self.ingestor.set_concurrency(**desired)
+                with self.control:
+                    if self.pending_concurrency is desired:
+                        self.pending_concurrency = None
+                    else:
+                        self.ingestor.reconfigure.set()
+
+    def pause_all(self):
+        with self.control:
+            self.ingestor.stop()
+            self.enabled = False
+            self.store.set_state('monitor_enabled', False)
+            if self.job and self.job['action'] == 'backfill':
+                self.job['paused'] = True
+                self.paused_backfill = self.job
+                self.store.set_state('paused_backfill', self.job)
+                self.store.set_state('active_backfill', None)
+            self.wake.set()
+        return {'accepted': True, 'reason': '全部采集正在暂停，已完成进度已保存；不会再提交新文件'}
 
     def request(self, action, hours=None, start_date=None):
         with self.control:
@@ -102,11 +146,11 @@ class Service:
         with self.control:
             if not self.job or self.job['action'] != 'backfill':
                 return {'accepted': False, 'reason': '当前没有正在进行的回填'}
+            self.ingestor.stop()
             self.job['paused'] = True
             self.paused_backfill = self.job
             self.store.set_state('paused_backfill', self.job)
             self.store.set_state('active_backfill', None)
-            self.ingestor.cancel.set()
             self.wake.set()
         return {'accepted': True, 'reason': '回填正在暂停，已完成进度已保存'}
 
@@ -143,7 +187,7 @@ class Service:
             self.enabled = enabled
             self.store.set_state("monitor_enabled", enabled)
             if not enabled and not (self.job and self.job['action'] == 'backfill'):
-                self.ingestor.cancel.set()
+                self.ingestor.stop()
             elif enabled and not (self.job and self.job.get('paused')):
                 self.ingestor.cancel.clear()
             self.wake.set()
@@ -178,6 +222,7 @@ class Service:
                 enabled = self.enabled
             result = None
             try:
+                self.apply_pending_concurrency()
                 if job and job["action"] == "export":
                     with self.ingestor.busy:
                         result = self.export_locked()
@@ -257,7 +302,7 @@ class Service:
 
     def close(self):
         self.shutdown.set()
-        self.ingestor.cancel.set()
+        self.ingestor.stop()
         self.wake.set()
         self.thread.join(timeout=self.settings.request_timeout+10)
         if self.thread.is_alive():
@@ -269,6 +314,7 @@ class Service:
                 "phase": self.ingestor.phase, "busy": self.ingestor.busy.locked(),
                 "current_file": self.ingestor.current_file, "job": self.job, "last_job": self.last_job,
                 "concurrency": self.ingestor.concurrency_status(),
+                "pending_concurrency": self.pending_concurrency,
                 "last_run": self.store.get_state('last_run'),
                 "paused_backfill": self.paused_backfill,
                 "last_error": self.store.get_state("last_error") or self.runtime_error,

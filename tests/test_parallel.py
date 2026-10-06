@@ -107,7 +107,7 @@ def test_parser_cancellation_is_cooperative(tmp_path, recent_ts, parser, row):
         parser(path, recent_ts, cancel=cancel)
 
 
-@pytest.mark.parametrize('config', [{'download_workers': 0}, {'download_workers': 33}, {'parser_workers': 0}, {'parser_workers': 9}])
+@pytest.mark.parametrize('config', [{'download_workers': 0}, {'download_workers': 65}, {'parser_workers': 0}, {'parser_workers': 17}])
 def test_concurrency_limits(config):
     with pytest.raises(ValueError):
         Settings(**config)

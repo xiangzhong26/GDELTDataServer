@@ -49,12 +49,14 @@ class Ingestor:
     def __init__(self, store: Store, settings: Settings, client=None):
         self.store, self.settings = store, settings
         self.client = client or httpx.Client(timeout=settings.request_timeout, follow_redirects=True,
+                                            limits=httpx.Limits(max_connections=64, max_keepalive_connections=64),
                                             headers={"User-Agent": "DSI-GDELTDataServer/0.1"})
         self.owns_client = client is None
         self.temp_dir = settings.data_dir / "tmp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.busy = threading.Lock()
         self.cancel = threading.Event()
+        self.reconfigure = threading.Event()
         self.phase = "idle"
         self.current_file = None
         self.on_update = None
@@ -66,6 +68,20 @@ class Ingestor:
         self.parser_cancel = None
         self.parser_broken = False
         self.timings = {}
+
+    def stop(self):
+        self.cancel.set()
+        if self.parser_cancel is not None:
+            self.parser_cancel.set()
+
+    def set_concurrency(self, download_workers, parser_workers):
+        # Called only between cycles with the ingest lock held and all files drained.
+        if parser_workers != self.settings.parser_workers and self.parser_pool is not None:
+            self.parser_pool.shutdown(wait=True, cancel_futures=True)
+            self.parser_pool = self.parser_cancel = None
+        self.settings.download_workers = download_workers
+        self.settings.parser_workers = parser_workers
+        self.reconfigure.clear()
 
     def record_timing(self, stage, elapsed):
         with self.active_lock:
@@ -180,9 +196,12 @@ class Ingestor:
             with self.stage(kind, ts, 'download'), tempfile.NamedTemporaryFile(prefix="gdelt-", suffix=".zip", dir=self.temp_dir, delete=False) as f:
                 path = Path(f.name)
                 size = 0
-                with self.client.stream("GET", file_url(kind, ts)) as response:
+                with self.client.stream("GET", file_url(kind, ts), timeout=httpx.Timeout(
+                        self.settings.request_timeout, connect=min(5, self.settings.request_timeout),
+                        read=min(5, self.settings.request_timeout))) as response:
                     response.raise_for_status()
-                    for block in response.iter_bytes(1024*1024):
+                    # Check cancellation on each received chunk, not after accumulating 1MB.
+                    for block in response.iter_bytes():
                         if self.cancel.is_set():
                             raise InterruptedError("同步已停止，批次将在后续重试")
                         size += len(block)
@@ -245,7 +264,7 @@ class Ingestor:
             if schedule:
                 self.schedule()
             self.check_disk()
-            pending = self.store.pending(limit or self.settings.batch_files, ranges=ranges,
+            pending = self.store.pending(limit or max(self.settings.batch_files, self.settings.download_workers), ranges=ranges,
                                          exclude_range=exclude_range, descending=descending)
             scheduling_seconds = time.monotonic()-started
             self.phase = "processing"
@@ -256,7 +275,7 @@ class Ingestor:
                 with ThreadPoolExecutor(self.settings.download_workers, thread_name_prefix='gdelt-file') as executor:
                     inflight = {}
                     def submit_next():
-                        if self.cancel.is_set():
+                        if self.cancel.is_set() or self.reconfigure.is_set():
                             return
                         row = next(rows, None)
                         if row is not None:
@@ -308,9 +327,7 @@ class Ingestor:
             self.busy.release()
 
     def close(self):
-        self.cancel.set()
-        if self.parser_cancel is not None:
-            self.parser_cancel.set()
+        self.stop()
         if self.parser_pool is not None:
             self.parser_pool.shutdown(wait=True, cancel_futures=True)
             self.parser_pool = None
