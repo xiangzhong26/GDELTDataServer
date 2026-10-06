@@ -145,23 +145,41 @@ class Store:
                 self._state(db, "scheduled_until", cursor)
         return count
 
-    def pending(self, limit, now=None):
+    @staticmethod
+    def work_filter(ranges=None, exclude_range=None):
+        clauses, args = [], []
+        if ranges is not None:
+            parts = []
+            for start, end in ranges:
+                parts.append('(file_ts>=?' + (' AND file_ts<?)' if end is not None else ')'))
+                args.append(start)
+                if end is not None:
+                    args.append(end)
+            clauses.append('('+' OR '.join(parts)+')' if parts else '0')
+        if exclude_range:
+            clauses.append('NOT (file_ts>=? AND file_ts<?)')
+            args.extend(exclude_range)
+        return ''.join(' AND '+c for c in clauses), args
+
+    def pending(self, limit, now=None, ranges=None, exclude_range=None, descending=False):
         now = now if now is not None else int(utcnow().timestamp())
         if limit <= 0:
             return []
         with self.connect() as db:
+            scope, scope_args = self.work_filter(ranges, exclude_range)
+            order = 'DESC' if descending else 'ASC'
             # Reserve part of each batch for retries and recent files, so a multi-year
             # history queue cannot starve live updates or indefinitely defer failures.
             quota = max(1, limit//4)
             rows = list(db.execute("SELECT * FROM ingest_file WHERE status='failed' AND next_retry<=? "
-                                   "ORDER BY next_retry,file_ts,kind LIMIT ?", (now, quota)))
+                                   + scope + " ORDER BY next_retry,file_ts,kind LIMIT ?", (now, *scope_args, quota)))
             rows += list(db.execute("SELECT * FROM ingest_file WHERE status='pending' AND file_ts>=? "
-                                    "ORDER BY file_ts,kind LIMIT ?", (now-DAY, min(quota, limit-len(rows)))))
+                                    + scope + f" ORDER BY file_ts {order},kind LIMIT ?", (now-DAY, *scope_args, min(quota, limit-len(rows)))))
             excluded = ' AND (kind,file_ts) NOT IN ('+','.join('(?,?)' for _ in rows)+')' if rows else ''
             args = [v for r in rows for v in (r['kind'], r['file_ts'])]
             rows += list(db.execute(
                 "SELECT * FROM ingest_file WHERE status IN ('pending','failed') AND next_retry<=? "
-                + excluded + " ORDER BY attempts,file_ts,kind LIMIT ?", (now, *args, limit-len(rows))))
+                + scope + excluded + f" ORDER BY attempts,file_ts {order},kind LIMIT ?", (now, *scope_args, *args, limit-len(rows))))
             return [dict(r) for r in rows]
 
     def mark_failed(self, kind, ts, error):
@@ -176,13 +194,15 @@ class Store:
             db.execute("UPDATE ingest_file SET status='failed',attempts=?,next_retry=?,error=? WHERE kind=? AND file_ts=?",
                        (attempt, now + delay, str(error)[:1000], kind, ts))
 
-    def has_unfinished(self):
+    def has_unfinished(self, ranges=None, exclude_range=None):
+        scope, args = self.work_filter(ranges, exclude_range)
         with self.connect() as db:
-            return db.execute("SELECT 1 FROM ingest_file WHERE status IN ('pending','failed') LIMIT 1").fetchone() is not None
+            return db.execute("SELECT 1 FROM ingest_file WHERE status IN ('pending','failed')"+scope+" LIMIT 1", args).fetchone() is not None
 
-    def retry_delay(self):
+    def retry_delay(self, ranges=None, exclude_range=None):
+        scope, args = self.work_filter(ranges, exclude_range)
         with self.connect() as db:
-            ts = db.execute("SELECT MIN(next_retry) FROM ingest_file WHERE status IN ('pending','failed')").fetchone()[0]
+            ts = db.execute("SELECT MIN(next_retry) FROM ingest_file WHERE status IN ('pending','failed')"+scope, args).fetchone()[0]
         return max(2, ts-int(utcnow().timestamp())) if ts is not None else 900
 
     def retry_failed(self):

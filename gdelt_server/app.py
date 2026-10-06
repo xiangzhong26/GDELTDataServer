@@ -173,6 +173,14 @@ def create_app(settings=None):
     def export():
         return app.state.service.request("export")
 
+    @app.post('/api/admin/backfill/pause', dependencies=protected)
+    def pause_backfill():
+        return app.state.service.pause_backfill()
+
+    @app.post('/api/admin/backfill/resume', dependencies=protected)
+    def resume_backfill():
+        return app.state.service.resume_backfill()
+
     @app.put("/api/admin/params", dependencies=protected)
     def params(body: dict):
         service = app.state.service

@@ -61,6 +61,14 @@ class Ingestor:
         start = self.store.get_state("scheduled_until")
         if start is None:
             start = horizon - self.settings.initial_hours * 3600
+            with self.store.connect() as db:
+                latest = [r[0] for r in db.execute("SELECT MAX(file_ts) FROM ingest_file WHERE status='done' GROUP BY kind")]
+            if len(latest) == 2:
+                # Use the slower source and overlap its final slot, so one source's
+                # newer timestamp cannot hide the other source's unfinished tail.
+                start = min(latest)
+        if self.store.get_state('incremental_start') is None:
+            self.store.set_state('incremental_start', min(start, horizon-self.settings.initial_hours*3600))
         oldest = horizon - self.settings.day_retention_days * DAY
         if start < oldest:
             self.store.set_state("unrecoverable_gap", {"start": start, "end": oldest,
@@ -72,11 +80,12 @@ class Ingestor:
         end = min(horizon, start + DAY)
         return self.store.enqueue(start, end, cursor=end)
 
-    def backfill(self, hours, start_ts=None):
+    def backfill(self, hours, start_ts=None, end_ts=None):
         if hours < 1 or hours > self.settings.day_retention_days * 24:
             raise ValueError("回填范围必须在1小时至日保留期之间")
         horizon = int(utcnow().timestamp()) // SLOT * SLOT
-        return self.store.enqueue(start_ts if start_ts is not None else horizon-hours*3600, horizon)
+        return self.store.enqueue(start_ts if start_ts is not None else horizon-hours*3600,
+                                  end_ts if end_ts is not None else horizon)
 
     def process(self, kind, ts):
         self.check_disk()
@@ -107,7 +116,7 @@ class Ingestor:
             if path is not None:
                 path.unlink(missing_ok=True)
 
-    def run_once(self, schedule=True, limit=None, clear_cancel=True):
+    def run_once(self, schedule=True, limit=None, clear_cancel=True, ranges=None, exclude_range=None, descending=False):
         if not self.busy.acquire(blocking=False):
             return {"skipped": "已有同步或快照任务运行中"}
         done = failed = 0
@@ -122,7 +131,8 @@ class Ingestor:
             if schedule:
                 self.schedule()
             self.check_disk()
-            pending = self.store.pending(limit or self.settings.batch_files)
+            pending = self.store.pending(limit or self.settings.batch_files, ranges=ranges,
+                                         exclude_range=exclude_range, descending=descending)
             self.phase = "processing"
             for row in pending:
                 if self.cancel.is_set():
