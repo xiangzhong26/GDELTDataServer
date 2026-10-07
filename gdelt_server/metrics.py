@@ -216,7 +216,7 @@ class Window:
 
 
 def make_window(days: int, now=None) -> Window:
-    days = max(1, min(int(days), 730))
+    days = max(1, min(int(days), 1185))
     now = int((now if now is not None else utcnow()).timestamp())
     # ≤7 天用小时级（趋势图要看得出日内波动），更长一律用日级聚合：
     # 365 天如果走小时档，要扫 8760 × 国家数 × 大类数 行。

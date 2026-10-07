@@ -191,3 +191,28 @@ def test_snapshot_exports_extra_daily_history_for_short_windows(store,monkeypatc
     assert (455,'attitude') in calls and (455,'country-risk') in calls and (455,'enterprise-risk') in calls
     assert snapshot['trend_history']['overview_all'][0]['event_count']==2
     assert snapshot['schema_version']==1
+
+
+def test_three_year_window_and_realtime_are_published_with_history(store,monkeypatch):
+    import gdelt_server.snapshot as module
+    from gdelt_server.metrics import make_window
+    calls=[]
+    def series(metrics,days,name):
+        calls.append((days,name))
+        return {}
+    monkeypatch.setattr(module,'all_series',series)
+    snapshot=build_snapshot(store,[1,1095])
+    assert set(snapshot['views'])=={'1','1095'}
+    assert snapshot['views']['1095']['overview']['common']['window']['days']==1095
+    assert snapshot['views']['1']['overview']['common']['window']['granularity']=='hour'
+    assert (1185,'attitude') in calls
+    assert make_window(1185).days==1185
+
+
+def test_existing_service_upgrades_windows_without_shortening_backfill_retention(tmp_path):
+    from gdelt_server.service import Service
+    settings=Settings(data_dir=tmp_path,snapshot_days=[7],day_retention_days=3650)
+    service=Service(settings)
+    assert service.settings.snapshot_days==[1,7,1095]
+    assert service.settings.day_retention_days==3650
+    assert settings.snapshot_days==[7]  # caller's settings are not mutated

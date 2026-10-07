@@ -22,7 +22,9 @@ class Service:
         self.queries = QueryCache(self.store)
         self.runtime_error = None
         settings.day_retention_days = max(settings.day_retention_days,
-                                          self.store.get_state("backfill_retention_days", 0))
+                                          self.store.get_state("backfill_retention_days", 0), 1185)
+        # Upgrade existing installations without requiring manual config edits.
+        settings.snapshot_days = sorted(set(settings.snapshot_days) | {1, 1095})
         saved = self.store.get_state('concurrency_settings')
         if saved:
             from .config import Settings

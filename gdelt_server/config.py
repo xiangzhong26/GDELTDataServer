@@ -25,14 +25,14 @@ class Settings(BaseModel):
     request_timeout: int = Field(60, ge=5, le=300)
     api_token: str = ""
     snapshot_read_token: str = ""
-    snapshot_days: list[int] = Field(default_factory=lambda: [7, 30, 90, 365])
+    snapshot_days: list[int] = Field(default_factory=lambda: [1, 7, 30, 90, 365, 1095])
 
     @model_validator(mode="after")
     def validate_settings(self):
         if self.hour_retention_days > self.day_retention_days:
             raise ValueError("小时保留期不能大于日保留期")
-        if not self.snapshot_days or any(d not in (7, 30, 90, 365) for d in self.snapshot_days):
-            raise ValueError("snapshot_days 只支持7、30、90、365")
+        if not self.snapshot_days or any(d not in (1, 7, 30, 90, 365, 1095) for d in self.snapshot_days):
+            raise ValueError("snapshot_days 只支持1、7、30、90、365、1095")
         if len(set(self.snapshot_days)) != len(self.snapshot_days):
             raise ValueError("snapshot_days 不能重复")
         if self.host not in ("127.0.0.1", "localhost", "::1") and len(self.api_token) < 24:

@@ -131,7 +131,7 @@ def _build_snapshot(store: Store, ranges):
                 if name == "attitude":
                     views[str(days)][name]["event_types_by_country"] = all_event_types(metrics, days)
     # 90 extra calendar days cover the moving-average lookback outside the longest view.
-    history_days = min(730, max(map(int, ranges)) + 90)
+    history_days = min(1185, max(map(int, ranges)) + 90)
     relation_history = all_series(metrics, history_days, 'attitude')
     overview_points = {}
     for points in relation_history.values():
@@ -171,7 +171,7 @@ def validate_snapshot(data):
     if any(not isinstance(data[k], dict) for k in ('metrics','params','codes')):
         raise ValueError('快照参数、口径或代码表结构不合法')
     for days, views in data["views"].items():
-        if days not in ("7", "30", "90", "365"):
+        if days not in ("1", "7", "30", "90", "365", "1095"):
             raise ValueError("不支持的快照时间范围")
         if not isinstance(views, dict):
             raise ValueError('快照视图结构不合法')

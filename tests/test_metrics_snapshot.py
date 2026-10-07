@@ -132,7 +132,7 @@ def test_api_default_off_auth_parameters_and_no_raw(tmp_path):
         assert response.status_code==200
         assert client.get('/api/gdelt/status',headers=headers).json()['parameter_version']==1
         assert client.get('/api/gdelt/metrics',headers=headers).json()['params']['tone_negative_divisor']==4
-        assert client.post('/api/admin/backfill',headers=headers,json={'hours':20000}).status_code==400
+        assert client.post('/api/admin/backfill',headers=headers,json={'hours':client.app.state.service.settings.day_retention_days*24+1}).status_code==400
 
 
 def test_network_bind_requires_token():

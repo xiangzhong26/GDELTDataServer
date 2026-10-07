@@ -111,8 +111,8 @@ def create_app(settings=None):
     @app.get("/api/gdelt/config", dependencies=protected)
     def config():
         service = app.state.service
-        return {"time_ranges": [{"days": d, "label": f"近{d}天", "granularity": "小时" if d == 7 else "天"}
-                                for d in settings.snapshot_days], "default_days": 30,
+        return {"time_ranges": [{"days": d, "label": {1:"实时 · 24小时",1095:"近3年"}.get(d,f"近{d}天"), "granularity": "小时" if d <= 7 else "天"}
+                                for d in service.settings.snapshot_days], "default_days": 30,
                 "monitor_running": service.enabled, "demo_mode": False,
                 "show_detail_panel": False, "show_source_links": False,
                 "refresh_seconds": settings.poll_seconds,
@@ -129,21 +129,21 @@ def create_app(settings=None):
         return getattr(metrics, name.replace("-", "_"))(days, country)
 
     @app.get("/api/gdelt/overview", dependencies=protected)
-    def overview(days: int = Query(30, ge=1, le=365), country: str = "", view: str = "china", fresh: bool = False):
+    def overview(days: int = Query(30, ge=1, le=1095), country: str = "", view: str = "china", fresh: bool = False):
         if view not in ("china", "partner"):
             raise HTTPException(400, "view仅支持china或partner")
         return metric_result("overview", days, country.upper(), view, fresh)
 
     @app.get("/api/gdelt/attitude", dependencies=protected)
-    def attitude(days: int = Query(30, ge=1, le=365), country: str = "USA", fresh: bool = False):
+    def attitude(days: int = Query(30, ge=1, le=1095), country: str = "USA", fresh: bool = False):
         return metric_result("attitude", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/country-risk", dependencies=protected)
-    def country_risk(days: int = Query(30, ge=1, le=365), country: str = "US", fresh: bool = False):
+    def country_risk(days: int = Query(30, ge=1, le=1095), country: str = "US", fresh: bool = False):
         return metric_result("country-risk", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/enterprise-risk", dependencies=protected)
-    def enterprise_risk(days: int = Query(30, ge=1, le=365), country: str = "US", fresh: bool = False):
+    def enterprise_risk(days: int = Query(30, ge=1, le=1095), country: str = "US", fresh: bool = False):
         return metric_result("enterprise-risk", days, country.upper(), fresh=fresh)
 
     @app.get("/api/gdelt/metrics", dependencies=protected)
@@ -156,7 +156,7 @@ def create_app(settings=None):
         return Metrics(app.state.service.store).code_reference()
 
     @app.get("/api/gdelt/ai-snapshot", dependencies=protected)
-    def ai_snapshot(days: int = Query(30, ge=1, le=365), iso3: str = "USA", fips: str = "US"):
+    def ai_snapshot(days: int = Query(30, ge=1, le=1095), iso3: str = "USA", fips: str = "US"):
         metrics = Metrics(app.state.service.store)
         data = metrics.ai_snapshot(iso3.upper(), fips.upper(), days)
         from .metrics import make_window
