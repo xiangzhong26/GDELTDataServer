@@ -13,7 +13,7 @@ import logging
 import zlib
 from datetime import datetime
 
-from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div
+from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div, country_score_components, enterprise_score_components, momentum_from_coverage, is_china_region
 from .store import Store, DAY, utcnow
 
 SCHEMA_VERSION = 1
@@ -44,18 +44,31 @@ def all_series(metrics, days, view):
         args = ()
     elif view == "country-risk":
         table, group, country_key = "agg_geo", "geo_country,bucket", "geo_country"
-        placeholders = ",".join("?" for _ in p.roots_security)
-        sums = ("SUM(n_events) event_count,SUM(sum_tone) sum_tone,"
-                "SUM(n_quad3)+SUM(n_quad4) conflict,"
-                f"SUM(CASE WHEN root_code IN ({placeholders}) THEN n_events ELSE 0 END) security")
-        where, args = "1=1", p.roots_security
-        blank = {"event_count": 0, "security": 0, "conflict": 0, "avg_tone": None}
+        groups=(p.roots_security,p.roots_social,p.roots_political)
+        cases=",".join(f"SUM(CASE WHEN root_code IN ({','.join('?' for _ in codes)}) THEN sum_w ELSE 0 END) {key}" for codes,key in zip(groups,('w_sec','w_soc','w_pol')))
+        placeholders=','.join('?' for _ in p.roots_security)
+        sums=("SUM(n_events) event_count,SUM(n_events) n_events,SUM(sum_sources) sum_sources,SUM(sum_w) sum_w,SUM(sum_tone) sum_tone,"
+              "SUM(n_quad3)+SUM(n_quad4) conflict,"+cases+f",SUM(CASE WHEN root_code IN ({placeholders}) THEN n_events ELSE 0 END) security")
+        where,args="1=1",(*p.roots_security,*p.roots_social,*p.roots_political,*p.roots_security)
+        blank={"event_count":0,"security":0,"conflict":0,"avg_tone":None,"risk_score":None,"evidence":None,"momentum_available":False}
     else:
         table, group, country_key, sums = "agg_gkg", "country,bucket", "country", metrics._GKG_SUMS
         where, args = "1=1", ()
-        blank = {"total_docs": 0, "china_business_docs": 0, "avg_tone": None,
+        blank = {"total_docs": 0, "china_business_docs": 0, "avg_tone": None,"risk_score":None,"evidence":None,
                  **{f"{f}_docs": 0 for f in metrics.ER_FIELDS}}
     rows = metrics._agg(table, sums, group, win, where, head_args=args)
+    scored={}
+    if view=='enterprise-risk':
+        groups={}
+        for r in rows:groups.setdefault(r['bucket'],{})[r['country']]=r
+        for bucket,agg in groups.items():
+            for code,(_,score,ev) in enterprise_score_components(agg,p).items():scored[(bucket,code)]=(round(score,1),ev)
+    daily={}; day_coverage={}
+    if view=='country-risk':
+        daily_win=metrics.window(min(1185,days+30))
+        daily_rows=metrics._agg('agg_geo','SUM(n_events) n_events','geo_country,bucket',daily_win.__class__(daily_win.days,'day','day',daily_win.start//DAY*DAY,daily_win.end))
+        for r in daily_rows:daily.setdefault(r['geo_country'],{})[r['bucket']]=r['n_events']
+        day_coverage=metrics.store.coverage_buckets('events',daily_win.start//DAY*DAY,daily_win.end,DAY)
     points = {}
     for r in rows:
         n = max(r.get("n_events", r.get("event_count", r.get("total_docs", 0))), 1)
@@ -65,9 +78,15 @@ def all_series(metrics, days, view):
                         attitude_score=round(100*_safe_div(p.w_goldstein*r["sum_gold_w"]+p.w_quad*r["sum_quad_w"]+p.w_tone*r["sum_tone_w"],r["sum_w"]),1),
                         avg_goldstein=round(10*r["sum_gold"]/n,2), avg_tone=round(10*r["sum_tone"]/n,2))
         elif view == "country-risk":
+            today=r['bucket']//DAY*DAY
+            momentum=momentum_from_coverage(daily.get(r['geo_country'],{}),today,p,today-30*DAY,day_coverage)
+            components=country_score_components(r,p,momentum)
+            item.update(risk_score=round(components[6],1) if r['n_events']>=p.min_events and not is_china_region(r['geo_country']) else None,evidence=components[7],momentum_available=momentum is not None)
             item.update(event_count=int(r["event_count"]), conflict=int(r["conflict"]),
                         security=int(r["security"]), avg_tone=round(10*r["sum_tone"]/n,2))
         else:
+            score,ev=scored.get((r["bucket"],r["country"]),(None,None))
+            item.update(risk_score=score,evidence=ev)
             item.update(total_docs=int(r["total_docs"]), china_business_docs=int(r["china_business_docs"]),
                         avg_tone=round(r["sum_tone"]/n,2),
                         **{f"{f}_docs": int(r[f"{f}_docs"]) for f in metrics.ER_FIELDS})
@@ -133,24 +152,16 @@ def _build_snapshot(store: Store, ranges):
     # 90 extra calendar days cover the moving-average lookback outside the longest view.
     history_days = min(1185, max(map(int, ranges)) + 90)
     relation_history = all_series(metrics, history_days, 'attitude')
-    overview_points = {}
-    for points in relation_history.values():
-        for point in points:
-            bucket = point['bucket']
-            if bucket not in overview_points:
-                overview_points[bucket] = {"bucket": bucket, "timestamp": point['timestamp'],
-                    "complete": point['complete'], "event_count": 0 if point['event_count'] is not None else None}
-            if point['event_count'] is not None:
-                overview_points[bucket]['event_count'] += point['event_count']
+    global_history=metrics.overview(days=history_days)['series']
     trend_history = {'attitude': relation_history, 'overview': relation_history,
-        'overview_all': [overview_points[b] for b in sorted(overview_points)],
+        'overview_all': global_history,
         'country-risk': all_series(metrics, history_days, 'country-risk'),
         'enterprise-risk': all_series(metrics, history_days, 'enterprise-risk')}
     return {"schema_version": SCHEMA_VERSION, "snapshot_id": uuid.uuid4().hex,
             "created_at": metrics.now().isoformat(), "data_version": store.get_state("data_version", 0),
             "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v1",
             "params": metrics.params().as_dict(), "metrics": metric_catalog(metrics.params()),
-            "codes": metrics.code_reference(), "views": views, "trend_history": trend_history}
+            "codes": metrics.code_reference(), "views": views, "trend_history": trend_history, "score_trend_definition":{"aggregation":"每个UTC日/小时桶独立评分，非整个展示窗口的汇总分；国家风险动量使用此前30日。", "enterprise":"同一桶内达到样本门槛的国家横截面百分位，参照国家变化会影响跨期比较。"}}
 
 
 def validate_snapshot(data):

@@ -80,7 +80,7 @@ def test_snapshot_country_details_equal_direct_queries(store,tmp_path,recent_ts)
         for days in (7,30):
             actual=snapshot_view(snapshot,name,days,country);expected=method(days,country)
             assert actual['countries']==expected['countries']
-            assert actual['series']==expected['series']
+            assert [{k:point[k] for k in reference} for point,reference in zip(actual['series'],expected['series'],strict=True)]==expected['series']
             assert actual['selected']==expected['selected']
             if name=='attitude':assert actual['event_types']==expected['event_types']
     raw=encode_json(snapshot)

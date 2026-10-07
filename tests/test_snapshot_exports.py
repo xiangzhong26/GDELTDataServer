@@ -189,7 +189,8 @@ def test_snapshot_exports_extra_daily_history_for_short_windows(store,monkeypatc
     monkeypatch.setattr(module,'all_series',series)
     snapshot=build_snapshot(store,[7,365])
     assert (455,'attitude') in calls and (455,'country-risk') in calls and (455,'enterprise-risk') in calls
-    assert snapshot['trend_history']['overview_all'][0]['event_count']==2
+    assert len(snapshot['trend_history']['overview_all'])==455
+    assert all('attitude_score' in p for p in snapshot['trend_history']['overview_all'])
     assert snapshot['schema_version']==1
 
 
@@ -216,3 +217,33 @@ def test_existing_service_upgrades_windows_without_shortening_backfill_retention
     assert service.settings.snapshot_days==[1,7,1095]
     assert service.settings.day_retention_days==3650
     assert settings.snapshot_days==[7]  # caller's settings are not mutated
+
+
+def test_historical_scores_use_shared_formulas_per_bucket(store,tmp_path,recent_ts):
+    from test_metrics_snapshot import populate
+    from gdelt_server.metrics import Metrics
+    from gdelt_server.snapshot import all_series
+    populate(store,tmp_path,recent_ts)
+    m=Metrics(store)
+    # All fixture evidence lives in one bucket; the ranking and this bucket share statistics.
+    for name,method,code in [('country-risk',m.country_risk,'US'),('enterprise-risk',m.enterprise_risk,'US')]:
+        points=all_series(m,7,name)[code]
+        valid=[p for p in points if p['risk_score'] is not None]
+        assert valid
+        assert valid[-1]['risk_score']==method(7,code)['selected']['risk_score']
+        assert all(0<=p['risk_score']<=100 for p in valid)
+        assert all(p['risk_score'] is None for p in points if not p['collected_files'])
+    overview=m.overview(7)
+    points=[p for p in overview['series'] if p['attitude_score'] is not None]
+    assert points[-1]['attitude_score']==overview['summary']['attitude_score']
+
+
+def test_enterprise_history_does_not_mix_percentile_reference_dates():
+    from gdelt_server.metrics import Params,enterprise_score_components
+    fields=('security','political','economic','infrastructure','social','health')
+    def row(negative):
+        return {'total_docs':100,'sum_tone':-negative*100,**{f+'_docs':0 for f in fields}}
+    a=enterprise_score_components({'US':row(1),'RS':row(2)},Params())
+    b=enterprise_score_components({'US':row(2),'RS':row(1)},Params())
+    assert a['US'][0]['negativity']==0
+    assert b['US'][0]['negativity']==100

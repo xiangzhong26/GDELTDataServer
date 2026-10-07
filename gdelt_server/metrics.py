@@ -178,6 +178,51 @@ def percentile_scores(values: Sequence[float]) -> list[float]:
     return out
 
 
+def country_score_components(a, p, momentum_value=None):
+    """Shared formula for window rankings and historical bucket scores."""
+    n = int(a["n_events"] or 0)
+    total_w = a["sum_w"] or 1.0
+    ev = evidence_events(n, int(a["sum_sources"]), p)
+    security = shrink_to_neutral(saturation(a["w_sec"] / total_w, p.scale_security), ev)
+    social = shrink_to_neutral(saturation(a["w_soc"] / total_w, p.scale_social), ev)
+    political = shrink_to_neutral(saturation(a["w_pol"] / total_w, p.scale_political), ev)
+    avg_tone = 10.0 * a["sum_tone"] / max(n, 1)
+    media = shrink_to_neutral(clamp(max(0.0, -avg_tone) / max(p.tone_negative_divisor, 1e-6) * 100.0), ev)
+    momentum = shrink_to_neutral(50.0 if momentum_value is None else momentum_value, ev)
+    total = (p.w_cr_security*security+p.w_cr_social*social+p.w_cr_political*political+p.w_cr_media*media+p.w_cr_momentum*momentum)
+    return security,social,political,avg_tone,media,momentum,total,ev
+
+
+def enterprise_score_components(agg, p):
+    """Same-bucket cross-country percentiles; never rank different dates together."""
+    fields = (*BaseMetrics.ER_FIELDS, "negativity")
+    codes = [c for c,a in agg.items() if not is_china_region(c) and a["total_docs"] >= p.min_docs]
+    raw = {f:[] for f in fields}
+    for c in codes:
+        a=agg[c]; total=a["total_docs"] or 1.0
+        for f in BaseMetrics.ER_FIELDS: raw[f].append(a[f"{f}_docs"]/total)
+        raw["negativity"].append(max(0.0,-a["sum_tone"]/total))
+    pct={f:percentile_scores(v) for f,v in raw.items()}
+    weights={f:getattr(p,"w_er_"+f) for f in fields}
+    result={}
+    for i,c in enumerate(codes):
+        ev=evidence_docs(int(agg[c]["total_docs"]),p)
+        scores={f:shrink_to_neutral(pct[f][i],ev) for f in fields}
+        result[c]=(scores,sum(weights[f]*scores[f] for f in fields),ev)
+    return result
+
+
+def momentum_from_coverage(day_counts,today,p,start,coverage):
+    k=p.momentum_recent_days
+    recent=list(range(today-k*DAY,today,DAY))
+    if any(not coverage.get(d,{}).get("complete") for d in recent): return None
+    base=[d for d in range(start,today-k*DAY,DAY) if coverage.get(d,{}).get("complete")]
+    if not base:return None
+    recent_avg=sum(day_counts.get(d,0) for d in recent)/k
+    base_avg=max(1.,sum(day_counts.get(d,0) for d in base)/len(base))
+    return clamp(50+p.momentum_sensitivity*(recent_avg/base_avg-1))
+
+
 def risk_level(score: float) -> str:
     if score >= 75:
         return "极高"
@@ -597,19 +642,7 @@ class BaseMetrics:
             n = int(a["n_events"] or 0)
             if n < p.min_events:
                 continue
-            total_w = a["sum_w"] or 1.0
-            ev = evidence_events(n, int(a["sum_sources"]), p)
-            security = shrink_to_neutral(saturation(a["w_sec"] / total_w, p.scale_security), ev)
-            social = shrink_to_neutral(saturation(a["w_soc"] / total_w, p.scale_social), ev)
-            political = shrink_to_neutral(saturation(a["w_pol"] / total_w, p.scale_political), ev)
-            avg_tone = 10.0 * a["sum_tone"] / n
-            media = shrink_to_neutral(
-                clamp(max(0.0, -avg_tone) / max(p.tone_negative_divisor, 1e-6) * 100.0), ev)
-            momentum = shrink_to_neutral(
-                self._momentum(daily.get(code, {}), today, p), ev)
-            total = (p.w_cr_security * security + p.w_cr_social * social
-                     + p.w_cr_political * political + p.w_cr_media * media
-                     + p.w_cr_momentum * momentum)
+            security,social,political,avg_tone,media,momentum,total,ev = country_score_components(a,p,self._momentum(daily.get(code,{}),today,p))
             out.append({
                 "code": code, "iso3": FIPS_TO_ISO3.get(code, ""),
                 "name": fips_label(code),
@@ -688,29 +721,14 @@ class BaseMetrics:
                 "sum_tone": r["sum_tone"] or 0.0,
                 **{f"{f}_docs": int(r[f"{f}_docs"] or 0) for f in self.ER_FIELDS}}
 
-        codes = [c for c, a in agg.items() if (a["total_docs"] or 0) >= p.min_docs]
-        raw = {f: [] for f in (*self.ER_FIELDS, "negativity")}
-        for c in codes:
-            a = agg[c]
-            total = a["total_docs"] or 1.0
-            for f in self.ER_FIELDS:
-                raw[f].append(a[f"{f}_docs"] / total)
-            raw["negativity"].append(max(0.0, -(a["sum_tone"] / total)))
-        pct = {f: percentile_scores(v) for f, v in raw.items()}
-
-        weights = {"security": p.w_er_security, "political": p.w_er_political,
-                   "economic": p.w_er_economic, "infrastructure": p.w_er_infrastructure,
-                   "social": p.w_er_social, "health": p.w_er_health,
-                   "negativity": p.w_er_negativity}
+        scored = enterprise_score_components(agg,p)
+        codes = list(scored)
 
         out = []
         for i, c in enumerate(codes):
             a = agg[c]
             docs = int(a["total_docs"])
-            ev = evidence_docs(docs, p)
-            scores = {f: shrink_to_neutral(pct[f][i], ev)
-                      for f in (*self.ER_FIELDS, "negativity")}
-            total = sum(weights[f] * scores[f] for f in weights)
+            scores,total,ev = scored[c]
             row = {
                 "code": c, "iso3": FIPS_TO_ISO3.get(c, ""),
                 "name": fips_label(c),
@@ -800,11 +818,12 @@ class BaseMetrics:
         for b, acc in buckets.items():
             m = max(acc["n_events"], 1)
             pts[b] = {"bucket": b, "timestamp": _iso(b),
+                      "attitude_score": round(100*_safe_div(p.w_goldstein*acc['sum_gold_w']+p.w_quad*acc['sum_quad_w']+p.w_tone*acc['sum_tone_w'],acc['sum_w']),1) if acc['n_events'] else None,
                       "event_count": int(acc["n_events"]),
                       "mentions": int(acc["sum_mentions"]),
                       "avg_goldstein": round(10.0 * acc["sum_gold"] / m, 2),
                       "avg_tone": round(10.0 * acc["sum_tone"] / m, 2)}
-        series = _fill_series(pts, win, {"event_count": 0, "mentions": 0,
+        series = _fill_series(pts, win, {"event_count": 0, "mentions": 0,"attitude_score":None,
                                          "avg_goldstein": None, "avg_tone": None})
 
         partner_rows = sorted(
@@ -982,15 +1001,7 @@ class Metrics(BaseMetrics):
             cache[key] = self.store.coverage_buckets("events", start, today, DAY)
         self._momentum_coverage = cache
         coverage = cache[key]
-        recent = list(range(today-k*DAY, today, DAY))
-        if any(not coverage.get(d, {}).get("complete") for d in recent):
-            return None
-        base = [d for d in range(start, today-k*DAY, DAY) if coverage.get(d, {}).get("complete")]
-        if not base:
-            return None
-        recent_avg = sum(day_counts.get(d, 0) for d in recent)/k
-        base_avg = max(1., sum(day_counts.get(d, 0) for d in base)/len(base))
-        return clamp(50 + p.momentum_sensitivity*(recent_avg/base_avg-1))
+        return momentum_from_coverage(day_counts,today,p,start,coverage)
 
     def decorate(self, result, days, source, fields):
         win = self.window(days)
@@ -1016,7 +1027,7 @@ class Metrics(BaseMetrics):
 
     def overview(self, days=7, view="china", country="USA"):
         return self.decorate(super().overview(days, view, country), days, "events",
-                             ("event_count", "mentions", "avg_goldstein", "avg_tone"))
+                             ("event_count", "mentions", "attitude_score", "avg_goldstein", "avg_tone"))
 
     def attitude(self, days=30, country="USA"):
         return self.decorate(super().attitude(days, country), days, "events",

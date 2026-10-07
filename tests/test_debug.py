@@ -25,7 +25,10 @@ def test_cached_country_results_match_calculation(store,tmp_path,recent_ts,name,
     expected=getattr(Metrics(store),name.replace('-','_'))(30,country)
     actual=cache.resolve(name,30,country)
     for field in ('countries','selected','series','coverage'):
-        assert actual[field]==expected[field]
+        if field=='series':
+            assert [{k:point[k] for k in reference} for point,reference in zip(actual[field],expected[field],strict=True)]==expected[field]
+        else:
+            assert actual[field]==expected[field]
     if name=='attitude': assert actual['event_types']==expected['event_types']
     with patch.object(Metrics,name.replace('-','_'),side_effect=AssertionError('country switch must reuse grouped results')):
         assert cache.resolve(name,30,'FR' if name!='attitude' else 'FRA')['selected'] == next((r for r in actual['countries'] if r['code'] in ('FR','FRA')),None)
