@@ -15,8 +15,11 @@ from datetime import datetime
 
 from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div, country_score_components, enterprise_score_components, momentum_from_coverage, is_china_region
 from .store import Store, DAY, utcnow
+from .series_codec import pack_series, expand_series
 
 SCHEMA_VERSION = 1
+MAX_UNPACKED = 256*1024**2
+MAX_COMPRESSED = 64*1024**2
 
 
 def publication_metadata(data):
@@ -219,7 +222,14 @@ class SnapshotFiles:
 
     def publish(self, data):
         validate_snapshot(data)
-        payload = gzip.compress(encode_json(data), compresslevel=6, mtime=0)
+        # Keep compact rows in the cloud cache, rather than millions of dictionaries.
+        raw = encode_json(pack_series(data))
+        if len(raw) > MAX_UNPACKED:
+            raise ValueError('紧凑结果快照仍超过256MB，请减少发布窗口；上一份快照继续保留')
+        payload = gzip.compress(raw, compresslevel=6, mtime=0)
+        del raw
+        if len(payload) > MAX_COMPRESSED:
+            raise ValueError('结果快照压缩后超过64MB；上一份快照继续保留')
         return self.publish_bytes(payload, data)
 
     def publish_bytes(self, payload, data):
@@ -328,6 +338,8 @@ def snapshot_view(data, name, days, country):
     except KeyError as exc:
         raise ValueError("快照未包含该时间范围或视图") from exc
     common = dict(record["common"])
+    if 'series' in common:
+        common['series'] = expand_series(common['series'])
     common["snapshot_id"] = data["snapshot_id"]
     common["snapshot_created_at"] = data["created_at"]
     # Freshness must be evaluated at read time, even if this snapshot is old.
@@ -340,10 +352,10 @@ def snapshot_view(data, name, days, country):
         if country:
             # Old schema-1 bundles can reuse their existing attitude trends.
             series = record.get('series_by_country', data['views'][str(days)]['attitude']['series_by_country'])
-            common['series'] = series.get(country.upper(), [])
+            common['series'] = expand_series(series.get(country.upper(), []))
     if name != "overview":
         common["selected"] = next((r for r in common["countries"] if r["code"] == country.upper()), None)
-        common["series"] = record["series_by_country"].get(country.upper(), [])
+        common["series"] = expand_series(record["series_by_country"].get(country.upper(), []))
         if name == "attitude":
             common["event_types"] = record["event_types_by_country"].get(country.upper(), [])
     return common

@@ -89,7 +89,20 @@ def test_same_id_is_immutable_and_duplicate_is_idempotent(store, tmp_path):
     changed = {**snapshot,'parameter_version':snapshot['parameter_version']+1}
     with pytest.raises(ValueError, match='相同快照ID'):
         files.publish(changed)
-    assert files.read() == snapshot
+    from gdelt_server.series_codec import pack_series
+    assert files.read() == pack_series(snapshot)
+
+
+@pytest.mark.parametrize('limit', ['MAX_UNPACKED', 'MAX_COMPRESSED'])
+def test_publisher_checks_receiver_limits_without_replacing_previous(store, tmp_path, monkeypatch, limit):
+    import gdelt_server.snapshot as module
+    files = SnapshotFiles(tmp_path/'snapshots')
+    snapshot = build_snapshot(store, [7])
+    previous = files.publish(snapshot)
+    monkeypatch.setattr(module, limit, 1)
+    with pytest.raises(ValueError, match='超过'):
+        files.publish(build_snapshot(store, [7]))
+    assert files.manifest() == previous
 
 
 @pytest.mark.parametrize('change', [

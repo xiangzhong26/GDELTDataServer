@@ -620,3 +620,11 @@ sudo systemctl start gdelt-data-server
 该功能仅在可信个人设备启用。换浏览器、换网站地址（包括localhost与127.0.0.1）、隐私窗口、清除网站数据或更换令牌后可能需要重新输入。忘记连接只影响当前页面；其他已打开页面内存中的连接仍可用，清除各窗口需关闭它们或在服务端更换令牌。
 
 更新方式仍为 `bash /opt/GDELTDataServer/deploy/update.sh`，更新后Ctrl+F5；这次包括之前新增的历史得分导出。随后生成结果快照并在DSI立即同步。前端回归测试：`node tests/dashboard.test.cjs` 和 `node --test tests/test_dashboard_auth.cjs`（Node仅用于开发测试，服务运行不需要Node）。
+
+## 三年趋势快照体积修复
+
+新版发布使用 `columns-v1` 紧凑趋势编码，重复字段名和可推导的 UTC 日期不再逐点保存；得分、数量、零值、缺失值、字段缺省以及采集覆盖标记保持不变。云端按需展开所选国家的趋势，而不是启动时展开所有国家。查询接口仍返回原来的点对象格式。
+
+**升级顺序：先更新云端 DSI，再更新本地 GDELTDataServer。** 云端执行 `bash /opt/DSI/deploy.sh`；本地执行 `bash /opt/GDELTDataServer/deploy/update.sh`。随后在工作台点“生成结果快照”，等待发布完成，再在 DSI 点“立即同步”。旧的大快照不会因为升级而自动变小，必须重新发布。无需重装 frp，也无需清除数据库或重新回填。
+
+DSI 继续兼容旧快照；新格式需要新版 DSI。256 MiB 解压和64 MiB 压缩上限继续保留，发布端也会在替换前检查这两个限制，超限时保留上一份快照。该修复减少体积和常驻内存，但没有承诺任意数量的历史窗口都能无限增长。

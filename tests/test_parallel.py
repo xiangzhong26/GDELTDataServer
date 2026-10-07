@@ -233,7 +233,9 @@ def test_sixteen_download_tasks_and_stage_timings(store, tmp_path, recent_ts):
         result = ingest.run_once(schedule=False, limit=16)
         assert result['processed'] == 16 and result['failed'] == 0
         for stage in ('download', 'parse_compute', 'parse_pipeline', 'commit'):
-            assert result['stage_seconds'][stage] > 0
+            # Published timings round to milliseconds; a fast mock stage can round to zero.
+            assert result['stage_seconds'][stage] >= 0
+        assert result['stage_seconds']['parse_pipeline'] > 0
         assert result['stage_seconds']['parse_queue_transfer'] >= 0
         assert result['scheduling_seconds'] >= 0
         assert not list(ingest.temp_dir.glob('*.zip'))
