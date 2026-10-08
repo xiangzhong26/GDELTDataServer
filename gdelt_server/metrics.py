@@ -1,5 +1,5 @@
 """Query-time metrics derived exclusively from retained sufficient statistics.
-Default coefficients preserve the DSI definitions; coverage is reported separately.
+Versioned media-risk rules; sample support and collection coverage are separate.
 """
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ from typing import Any, Iterable, Sequence
 from .cameo_names import CAMEO_NAMES_ZH
 from .fips_names import CHINA_REGION_CAMEO, CHINA_REGION_FIPS, FIPS_NAMES_ZH
 from .lookup import FIPS_TO_ISO3, ISO3_TO_FIPS
-from .store import DAY, HOUR, Store, bucket_of, utcnow
+from .store import DAY, HOUR, Store, bucket_of, utcnow, GKG_METRICS
+
+MODEL_VERSION = "media-risk-v3"
+RETIRED_PARAMS = {'scale_security','scale_social','scale_political',
+                  'ev_events_coef','ev_sources_coef','ev_docs_coef'}
 
 # ============================================================
 #  标签
@@ -54,9 +58,9 @@ class Params:
     w_tone: float = 0.10
 
     # ── 国家风险：CAMEO 大类归入哪个分项 ──
-    roots_security: tuple[str, ...] = ("18", "19", "20")
+    roots_security: tuple[str, ...] = ("15", "18", "19", "20")
     roots_social: tuple[str, ...] = ("14", "17")
-    roots_political: tuple[str, ...] = ("10", "11", "12", "13", "16", "17")
+    roots_political: tuple[str, ...] = ("10", "11", "12", "13", "16")
 
     # ── 国家风险：饱和曲线尺度（见文件头 ②）──
     scale_security: float = 0.12
@@ -67,11 +71,13 @@ class Params:
     tone_negative_divisor: float = 8.0
 
     # ── 国家风险：分项权重 ──
-    w_cr_security: float = 0.35
-    w_cr_social: float = 0.22
-    w_cr_political: float = 0.18
-    w_cr_media: float = 0.15
-    w_cr_momentum: float = 0.10
+    w_cr_security: float = 0.50
+    w_cr_social: float = 0.25
+    w_cr_political: float = 0.15
+    w_cr_media: float = 0.10
+    w_cr_momentum: float = 0.0
+    sample_prior: float = 20.0
+    risk_curve_power: float = 0.5
 
     # ── 动量：最近 N 个完整日 vs 之前的均值（见文件头 ⑥）──
     momentum_recent_days: int = 1
@@ -118,11 +124,36 @@ class Params:
 
     def save(self, store: Store) -> None:
         validate_params(self)
-        store.set_state("metric_params", {k: (list(v) if isinstance(v, tuple) else v)
-                                          for k, v in asdict(self).items()})
+        store.set_state("metric_params", self.as_dict())
 
     def as_dict(self) -> dict[str, Any]:
-        return {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(self).items()}
+        return {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(self).items()
+                if k not in RETIRED_PARAMS}
+
+
+def initialize_model(store):
+    """One atomic, idempotent parameter migration; never re-ingest completed files."""
+    import json
+    with store.connect(write=True) as db:
+        state = {r['key']: json.loads(r['value']) for r in db.execute(
+            "SELECT key,value FROM gdelt_state WHERE key IN ('model_version','metric_params','parameter_version')")}
+        if state.get('model_version') == MODEL_VERSION:
+            return
+        old = state.get('metric_params', {})
+        p = Params()
+        # Preserve supported attitude/custom sample gates; risk definitions change as a unit.
+        for name in ('w_goldstein','w_quad','w_tone','min_events','min_docs',
+                     'momentum_recent_days','momentum_sensitivity'):
+            if name in old:
+                setattr(p,name,old[name])
+        validate_params(p)
+        populated = bool(old) or db.execute('SELECT 1 FROM ingest_file LIMIT 1').fetchone() is not None
+        store._state(db, 'model_migration_backup', state)
+        store._state(db, 'metric_params', p.as_dict())
+        store._state(db, 'model_version', MODEL_VERSION)
+        store._state(db, 'parameter_version', state.get('parameter_version',0) + int(populated))
+        if populated:
+            store._state(db,'snapshot_dirty',True)
 
 
 # ============================================================
@@ -141,17 +172,13 @@ def saturation(rate: float | None, scale: float) -> float:
 
 
 def evidence_events(n_events: int, n_sources: int, p: Params) -> float:
-    return round(clamp(p.ev_events_coef * math.log1p(max(0, n_events))
-                       + p.ev_sources_coef * math.log1p(max(0, n_sources))), 1)
+    n = max(0, n_events)
+    return round(100 * n / (n + p.sample_prior), 1)
 
 
 def evidence_docs(n_docs: int, p: Params) -> float:
-    """
-    GKG 只有「文档数」一个样本量维度。原实现把它当成两个维度传了两遍
-    （`evidence_score(total_docs, total_docs)`），数值上等于系数 26，
-    这里直接写成单参数形式 —— 数值不变，口径不再自相矛盾。
-    """
-    return round(clamp(p.ev_docs_coef * math.log1p(max(0, n_docs))), 1)
+    """Sample reliability only; no double-counted media-source dimension."""
+    return evidence_events(n_docs, 0, p)
 
 
 def shrink_to_neutral(score: float, evidence: float) -> float:
@@ -183,31 +210,54 @@ def country_score_components(a, p, momentum_value=None):
     n = int(a["n_events"] or 0)
     total_w = a["sum_w"] or 1.0
     ev = evidence_events(n, int(a["sum_sources"]), p)
-    security = shrink_to_neutral(saturation(a["w_sec"] / total_w, p.scale_security), ev)
-    social = shrink_to_neutral(saturation(a["w_soc"] / total_w, p.scale_social), ev)
-    political = shrink_to_neutral(saturation(a["w_pol"] / total_w, p.scale_political), ev)
+    densities = [clamp(a[k] / total_w, 0, 1) for k in ('w_sec', 'w_soc', 'w_pol')]
+    security, social, political = [risk_response(d, p) * ev / 100 for d in densities]
     avg_tone = 10.0 * a["sum_tone"] / max(n, 1)
-    media = shrink_to_neutral(clamp(max(0.0, -avg_tone) / max(p.tone_negative_divisor, 1e-6) * 100.0), ev)
-    momentum = shrink_to_neutral(50.0 if momentum_value is None else momentum_value, ev)
-    total = (p.w_cr_security*security+p.w_cr_social*social+p.w_cr_political*political+p.w_cr_media*media+p.w_cr_momentum*momentum)
+    media = clamp(max(0.0, -avg_tone) / p.tone_negative_divisor * 100.0) * ev / 100
+    momentum = 50.0 if momentum_value is None else momentum_value
+    weights = (p.w_cr_security, p.w_cr_social, p.w_cr_political)
+    # Disjoint categories: max(weight) anchors an all-maximum-impact stream at 1.
+    intensity = sum(d*w for d,w in zip(densities, weights)) / max(weights)
+    total = ((1-p.w_cr_media) * risk_response(intensity, p) * ev / 100
+             + p.w_cr_media * media)
     return security,social,political,avg_tone,media,momentum,total,ev
 
 
+def risk_response(density, p):
+    """Endpoint-preserving response; power=.5 increases low-frequency sensitivity."""
+    return 100 * clamp(density, 0, 1) ** p.risk_curve_power
+
+
+def attitude_value(a, p):
+    raw = 100 * _safe_div(p.w_goldstein*a['sum_gold_w'] + p.w_quad*a['sum_quad_w']
+                         + p.w_tone*a['sum_tone_w'], a['sum_w'])
+    return raw * evidence_events(a['n_events'], 0, p) / 100
+
+
+def enterprise_density(a, field):
+    """Exact joint negativity for new records; explicit approximation for legacy."""
+    total = a['total_docs'] or 1
+    modeled = a.get('modeled_docs', 0) or 0
+    legacy = max(0, total-modeled)
+    legacy_tone = (a.get('sum_tone', 0) or 0) - (a.get('sum_modeled_tone', 0) or 0)
+    legacy_neg = clamp(-legacy_tone / legacy / 10, 0, 1) if legacy else 0
+    if field == 'negativity':
+        mass = (a.get('sum_negative_tone', 0) or 0) + legacy * legacy_neg
+    else:
+        legacy_domain = max(0, a[field+'_docs'] - (a.get(field+'_modeled_docs', 0) or 0))
+        mass = (a.get(field+'_negative', 0) or 0) + legacy_domain * legacy_neg
+    return clamp(mass/total, 0, 1)
+
+
 def enterprise_score_components(agg, p):
-    """Same-bucket cross-country percentiles; never rank different dates together."""
+    """Domain-specific adverse media density on a fixed scale, not percentiles."""
     fields = (*BaseMetrics.ER_FIELDS, "negativity")
     codes = [c for c,a in agg.items() if not is_china_region(c) and a["total_docs"] >= p.min_docs]
-    raw = {f:[] for f in fields}
-    for c in codes:
-        a=agg[c]; total=a["total_docs"] or 1.0
-        for f in BaseMetrics.ER_FIELDS: raw[f].append(a[f"{f}_docs"]/total)
-        raw["negativity"].append(max(0.0,-a["sum_tone"]/total))
-    pct={f:percentile_scores(v) for f,v in raw.items()}
     weights={f:getattr(p,"w_er_"+f) for f in fields}
     result={}
     for i,c in enumerate(codes):
         ev=evidence_docs(int(agg[c]["total_docs"]),p)
-        scores={f:shrink_to_neutral(pct[f][i],ev) for f in fields}
+        scores={f:risk_response(enterprise_density(agg[c], f), p)*ev/100 for f in fields}
         result[c]=(scores,sum(weights[f]*scores[f] for f in fields),ev)
     return result
 
@@ -345,12 +395,11 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
             "GKG 语调保留原值，两个来源的均值口径不同。",
             "分"),
         "evidence": _explain(
-            "证据充分度",
-            f"min(100, {p.ev_events_coef:g}·ln(1+事件数) + {p.ev_sources_coef:g}·ln(1+信源数))，0-100。",
-            "由事件数与信源数计算。",
-            "这是样本量启发式分数，不是统计置信度或采集覆盖率；信源数是逐事件"
-            "NumSources 的累加，未对媒体去重。50条事件且累计信源50时，默认公式已达100。"
-            "国家风险按它向50分收缩，企业风险另用文档数计算证据分。",
+            "样本支撑度",
+            f"100×n/(n+{p.sample_prior:g})；Events用事件数，GKG用文档数。",
+            "规则型样本收缩系数，不是统计置信度或采集覆盖率。",
+            "风险分向0收缩，对华倾向向0中性收缩；材料少表示估计保守，不表示现实安全。"
+            "与采集完整率分别查看；信源累计量不再重复放大支撑度。",
             "分"),
 
         # ── 对华态度 ──
@@ -359,7 +408,8 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
             f"事件方向分 = {p.w_goldstein:.0%}×Goldstein/10 + {p.w_quad:.0%}×四分类方向 "
             f"+ {p.w_tone:.0%}×语调/10；按提及权重 w 加权平均后 ×100，范围 -100 ~ +100。",
             "Events 表中 Actor2 为中国、Actor1 为该国的全部事件。",
-            "衡量的是**媒体报道中呈现的行为倾向**，不是民意调查，也不是官方立场。"
+            "最终乘n/(n+sample_prior)向0收缩；语调截断到±10。衡量的是"
+            "媒体报道中呈现的行为倾向，不是民意调查，也不是官方立场。"
             "英语媒体覆盖度远高于其他语种，小国样本稀疏时波动很大。",
             "分"),
         "conflict_share": _explain(
@@ -371,22 +421,20 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
         # ── 国家风险 ──
         "risk_security": _explain(
             "安全冲突分",
-            f"安全类事件（CAMEO 大类 {'/'.join(p.roots_security)}）的加权占比 r，"
-            f"经饱和曲线 100×(1-e^(-r/{p.scale_security:g})) 映射到 0-100，再按证据充分度收缩。",
+            f"安全类别{'/'.join(p.roots_security)}：r=负向Goldstein/10×提及权重之和/全部事件权重；"
+            f"分数=100×r^{p.risk_curve_power:g}×样本支撑系数。",
             "Events 表按 ActionGeo 国家聚合。",
-            f"饱和尺度 {p.scale_security:g} 目前是经验取值，缺乏公开出处，属于待校准参数。",
+            "Goldstein是类别固定强度，不是实际伤亡规模；类别分组互斥。",
             "分"),
         "risk_social": _explain(
             "社会稳定分",
-            f"社会类事件（大类 {'/'.join(p.roots_social)}）加权占比经饱和曲线"
-            f"（尺度 {p.scale_social:g}）映射，再按证据充分度收缩。",
+            f"社会类别{'/'.join(p.roots_social)}的负向类别强度密度，采用与安全分相同的幂次映射及样本收缩。",
             "同上。",
-            "大类 17（胁迫）同时计入社会与政治两项，两个分项并非互斥。",
+            "17仅进入社会分项，不再重复计入政治。",
             "分"),
         "risk_political": _explain(
             "政治压力分",
-            f"政治类事件（大类 {'/'.join(p.roots_political)}）加权占比经饱和曲线"
-            f"（尺度 {p.scale_political:g}）映射，再按证据充分度收缩。",
+            f"政治类别{'/'.join(p.roots_political)}的负向类别强度密度，采用与安全分相同的幂次映射及样本收缩。",
             "同上。", None, "分"),
         "risk_media": _explain(
             "媒体负面分",
@@ -407,22 +455,23 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
             "分"),
         "risk_score": _explain(
             "国家风险总分",
-            f"{p.w_cr_security:.0%}安全 + {p.w_cr_social:.0%}社会 + {p.w_cr_political:.0%}政治 "
-            f"+ {p.w_cr_media:.0%}媒体 + {p.w_cr_momentum:.0%}动量，0-100。",
-            "上述五个分项。",
-            "分数不参照其他国家，但属于尚未校准的事件构成评分，不是风险概率。"
-            "跨时间比较需保持参数、统计窗口和覆盖口径一致；短期动量的基准随窗口变化。"
-            "与下面的「企业经营风险」不是同一把尺子，两者的分数不可直接比大小。",
+            "先按安全/社会/政治权重合成强度密度，除以这三项的最大权重得到0–1的事件风险密度；"
+            f"事件分=100×密度^{p.risk_curve_power:g}×样本支撑系数；"
+            f"总分={1-p.w_cr_media:.0%}事件分+{p.w_cr_media:.0%}媒体分。",
+            f"{MODEL_VERSION}；新闻量动量单独显示，不进入总分。",
+            "不是展示分项分数的直接加权和，也不是风险概率。固定规则可比较相同窗口的变化；"
+            "权重、幂次是透明但尚未经验校准的模型选择。国家与企业指标衡量不同对象。",
             "分"),
 
         # ── 企业经营风险（GKG）──
         "er_dimension": _explain(
             "经营风险分项",
-            "该国报道中命中某类主题的文档占比，转换为**全部国家的横截面百分位**（0-100），"
-            "再按证据充分度收缩。",
+            f"逐篇负面强度=max(0,min(1,-Tone/10))；r=命中该领域的负面强度之和/文档数；"
+            f"分数=100×r^{p.risk_curve_power:g}×样本支撑系数。",
             "GDELT GKG 2.0 主题标签（GCAM/Themes 字段）。",
             "主题标签由 GDELT 的关键词规则生成，存在误标；本系统词表是主题领域识别，"
-            "非官方风险分类。贸易、能源、医疗等普通主题也会命中，未逐篇判定负面风险。",
+            "非官方风险分类。普通主题单独命中不会增加分数，必须同时有负面语调；"
+            "全文负面不保证风险针对该领域或该国，只是经营环境的媒体代理指标。",
             "分"),
         "er_score": _explain(
             "企业经营风险总分",
@@ -430,9 +479,9 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
             f"+ {p.w_er_infrastructure:.0%}基础设施 + {p.w_er_social:.0%}社会 "
             f"+ {p.w_er_health:.0%}健康 + {p.w_er_negativity:.0%}负面度，0-100。",
             "GKG 各主题文档密度。",
-            "**相对口径**：分数是横截面百分位，各分项是横截面百分位，总分是这些分项的加权平均，不等于总分自身的排名百分位。"
-            "换一批国家进来，同样的新闻会得到不同的分数，因此**不能跨时间比较**，"
-            "也不能和上面的「国家风险总分」比大小。这是已知的口径不一致问题。",
+            "固定密度尺度，不使用国家百分位，其他国家进出不会改变该国得分。"
+            "旧历史缺逐篇联合统计，用主题数×负面平均语调估算，joint_coverage标记实测比例；"
+            "实测与估算存在方法差异，跨期解读须检查该比例。它不是某家企业损失概率。",
             "分"),
         "china_business_docs": _explain(
             "涉中企报道数",
@@ -443,8 +492,8 @@ def metric_catalog(p: Params) -> dict[str, dict[str, str]]:
             "篇"),
         "negativity": _explain(
             "报道负面度",
-            "max(0, -该国报道平均语调)，再转横截面百分位。",
-            "GKG V2Tone 第 1 分量。", None, "分"),
+            "逐篇截尾负面强度的平均密度，经幂次映射与样本收缩。",
+            "GKG V2Tone 第1分量。", "旧历史以负面平均语调估算，未用横截面百分位。", "分"),
     }
 
 
@@ -488,10 +537,7 @@ class BaseMetrics:
         "n_events", "sum_mentions", "sum_sources", "sum_w",
         "sum_gold_w", "sum_tone_w", "sum_gold", "sum_tone",
         "n_quad1", "n_quad2", "n_quad3", "n_quad4"))
-    _GKG_SUMS = ", ".join(f"SUM({m}) {m}" for m in (
-        "total_docs", "security_docs", "political_docs", "economic_docs",
-        "infrastructure_docs", "social_docs", "health_docs",
-        "china_business_docs", "sum_tone", "sum_polarity"))
+    _GKG_SUMS = ", ".join(f"SUM({m}) {m}" for m in GKG_METRICS)
 
     def _agg(self, table: str, sums: str, group: str, win: Window,
              where: str = "1=1", args: Sequence = (),
@@ -530,9 +576,7 @@ class BaseMetrics:
             base + " AND actor1=?", (country,))}
 
         def score(acc: dict) -> float:
-            return 100.0 * _safe_div(
-                p.w_goldstein * acc["sum_gold_w"] + p.w_quad * acc["sum_quad_w"]
-                + p.w_tone * acc["sum_tone_w"], acc["sum_w"])
+            return attitude_value(acc, p)
 
         countries = []
         for code, acc in by_country.items():
@@ -605,9 +649,9 @@ class BaseMetrics:
 
         sec, soc, pol = (tuple(p.roots_security), tuple(p.roots_social),
                          tuple(p.roots_political))
-        cond = (f"SUM(CASE WHEN root_code IN ({_in(sec)}) THEN sum_w ELSE 0 END) w_sec, "
-                f"SUM(CASE WHEN root_code IN ({_in(soc)}) THEN sum_w ELSE 0 END) w_soc, "
-                f"SUM(CASE WHEN root_code IN ({_in(pol)}) THEN sum_w ELSE 0 END) w_pol, "
+        cond = (f"SUM(CASE WHEN root_code IN ({_in(sec)}) THEN MAX(0,-sum_gold_w) ELSE 0 END) w_sec, "
+                f"SUM(CASE WHEN root_code IN ({_in(soc)}) THEN MAX(0,-sum_gold_w) ELSE 0 END) w_soc, "
+                f"SUM(CASE WHEN root_code IN ({_in(pol)}) THEN MAX(0,-sum_gold_w) ELSE 0 END) w_pol, "
                 "SUM(n_events) n_events, SUM(sum_sources) sum_sources, "
                 "SUM(sum_w) sum_w, SUM(sum_tone) sum_tone, "
                 "SUM(n_quad3) + SUM(n_quad4) conflict")
@@ -741,6 +785,8 @@ class BaseMetrics:
                 "avg_polarity": round(a["sum_polarity"] / max(docs, 1), 2),
                 "risk_score": round(total, 1), "risk_level": risk_level(total),
                 "evidence": ev, "thin": docs < p.min_docs,
+                "joint_method": "measured" if a['modeled_docs'] >= docs else "legacy-estimate",
+                "joint_coverage": round(100*a['modeled_docs']/max(docs,1), 1),
             }
             for f in (*self.ER_FIELDS, "negativity"):
                 row[f] = round(scores[f], 1)
@@ -812,16 +858,14 @@ class BaseMetrics:
             "total_articles": int(total["sum_articles"]),
             "avg_goldstein": round(10.0 * total["sum_gold"] / n, 2),
             "avg_tone": round(10.0 * total["sum_tone"] / n, 2),
-            "attitude_score": round(100.0 * _safe_div(
-                p.w_goldstein * total["sum_gold_w"] + p.w_quad * total["sum_quad_w"]
-                + p.w_tone * total["sum_tone_w"], total["sum_w"]), 1),
+            "attitude_score": round(attitude_value(total, p), 1),
         }
 
         pts = {}
         for b, acc in buckets.items():
             m = max(acc["n_events"], 1)
             pts[b] = {"bucket": b, "timestamp": _iso(b),
-                      "attitude_score": round(100*_safe_div(p.w_goldstein*acc['sum_gold_w']+p.w_quad*acc['sum_quad_w']+p.w_tone*acc['sum_tone_w'],acc['sum_w']),1) if acc['n_events'] else None,
+                      "attitude_score": round(attitude_value(acc,p),1) if acc['n_events'] else None,
                       "event_count": int(acc["n_events"]),
                       "mentions": int(acc["sum_mentions"]),
                       "avg_goldstein": round(10.0 * acc["sum_gold"] / m, 2),
@@ -916,8 +960,8 @@ class BaseMetrics:
         out["caveats"] = [
             "GDELT 统计的是「被媒体报道的事件」，不等于实际发生的事件，英语媒体覆盖度显著更高。",
             "样本证据充分度不代表时间覆盖完整，必须同时检查coverage和数据截至时间。",
-            "国家风险总分是绝对口径（可跨时间比较），企业经营风险总分是横截面百分位"
-            "（只能同一时点跨国比较），两者不可直接比大小。",
+            "国家与企业分数使用固定规则，参数、统计窗口、输入统计方法一致时可比较变化；"
+            "企业旧历史为联合负面密度估算，须检查joint_coverage。分数均非风险概率。",
         ]
         return out
 
@@ -978,6 +1022,13 @@ def validate_params(p: Params):
     for key in ("scale_security", "scale_social", "scale_political", "tone_negative_divisor"):
         if getattr(p, key) <= 0:
             raise ValueError(f"{key} 必须大于0")
+    if p.sample_prior <= 0 or not 0 < p.risk_curve_power <= 1:
+        raise ValueError('sample_prior必须大于0，risk_curve_power范围(0,1]')
+    if p.w_cr_momentum != 0 or max(p.w_cr_security,p.w_cr_social,p.w_cr_political) <= 0:
+        raise ValueError('新闻动量不参与风险总分，w_cr_momentum必须为0，事件分项权重不能全为0')
+    groups = [set(p.roots_security), set(p.roots_social), set(p.roots_political)]
+    if any(groups[i]&groups[j] for i in range(3) for j in range(i+1,3)):
+        raise ValueError('国家风险事件类别不得在分项间重复')
     if not 1 <= p.momentum_recent_days <= 30 or p.min_docs < 1 or p.min_events < 1:
         raise ValueError("近期天数范围1至30，最小样本必须至少为1")
 
@@ -1013,7 +1064,8 @@ class Metrics(BaseMetrics):
         result["coverage"] = coverage
         result["data_version"] = self.store.get_state("data_version", 0)
         result["parameter_version"] = self.store.get_state("parameter_version", 0)
-        result["parser_version"] = "aggregate-v2"
+        result["parser_version"] = "aggregate-v3"
+        result["model_version"] = MODEL_VERSION
         result["window"].update(start=_iso(win.start), end=_iso(win.end), timezone="UTC",
                                 definition="含当前未完整桶的最近自然日/小时桶")
         for point in result.get("series", []):
@@ -1050,12 +1102,13 @@ class Metrics(BaseMetrics):
         for row in result["countries"]:
             row["momentum_available"] = self.momentum_value(daily.get(row["code"], {}), today, p) is not None
         result["minimum_events"] = p.min_events
-        result["momentum_note"] = "近期完整日或基线不足时，动量用50中性值参与计算，并明确标记不可用。"
+        result["momentum_note"] = "动量仅表示新闻量变化，不参与风险总分；缺完整日或基线时不可用。"
         return self.decorate(result, days, "events", ("event_count", "security", "conflict", "avg_tone"))
 
     def enterprise_risk(self, days=30, country="US"):
         result = super().enterprise_risk(days, country)
         result["minimum_docs"] = self.params().min_docs
-        result["percentile_reference_count"] = len(result["countries"])
+        result["scoring_method"] = "fixed-adverse-domain-density"
+        result["history_note"] = "joint_coverage低于100%时含旧数据联合密度估算；新增记录采用逐篇主题与负面语调联合统计。"
         return self.decorate(result, days, "gkg", ("total_docs", "china_business_docs", "avg_tone",
                                                     *[f"{f}_docs" for f in self.ER_FIELDS]))

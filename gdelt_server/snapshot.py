@@ -13,7 +13,7 @@ import logging
 import zlib
 from datetime import datetime
 
-from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div, country_score_components, enterprise_score_components, momentum_from_coverage, is_china_region
+from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div, country_score_components, enterprise_score_components, momentum_from_coverage, is_china_region, attitude_value, MODEL_VERSION
 from .store import Store, DAY, HOUR, utcnow
 from .series_codec import pack_series, expand_series
 from .chunk_transport import compress_chunks
@@ -25,6 +25,7 @@ MAX_COMPRESSED = 64*1024**2
 
 def publication_metadata(data):
     return {'schema_version':data['schema_version'], 'parser_version':data.get('parser_version'),
+            'model_version':data.get('model_version'),
             'time_ranges':sorted(int(d) for d in data['views']),
             'view_names':['overview','attitude','country-risk','enterprise-risk'],
             'download_path':f"/api/snapshots/versions/{data['snapshot_id']}/download",
@@ -51,7 +52,7 @@ def all_series(metrics, days, view, hourly=False):
     elif view == "country-risk":
         table, group, country_key = "agg_geo", "geo_country,bucket", "geo_country"
         groups=(p.roots_security,p.roots_social,p.roots_political)
-        cases=",".join(f"SUM(CASE WHEN root_code IN ({','.join('?' for _ in codes)}) THEN sum_w ELSE 0 END) {key}" for codes,key in zip(groups,('w_sec','w_soc','w_pol')))
+        cases=",".join(f"SUM(CASE WHEN root_code IN ({','.join('?' for _ in codes)}) THEN MAX(0,-sum_gold_w) ELSE 0 END) {key}" for codes,key in zip(groups,('w_sec','w_soc','w_pol')))
         placeholders=','.join('?' for _ in p.roots_security)
         sums=("SUM(n_events) event_count,SUM(n_events) n_events,SUM(sum_sources) sum_sources,SUM(sum_w) sum_w,SUM(sum_tone) sum_tone,"
               "SUM(n_quad3)+SUM(n_quad4) conflict,"+cases+f",SUM(CASE WHEN root_code IN ({placeholders}) THEN n_events ELSE 0 END) security")
@@ -81,7 +82,7 @@ def all_series(metrics, days, view, hourly=False):
         item = {"bucket": r["bucket"], "timestamp": _iso(r["bucket"])}
         if view == "attitude":
             item.update(event_count=int(r["n_events"]), mentions=int(r["sum_mentions"]),
-                        attitude_score=round(100*_safe_div(p.w_goldstein*r["sum_gold_w"]+p.w_quad*r["sum_quad_w"]+p.w_tone*r["sum_tone_w"],r["sum_w"]),1),
+                        attitude_score=round(attitude_value(r,p),1),
                         avg_goldstein=round(10*r["sum_gold"]/n,2), avg_tone=round(10*r["sum_tone"]/n,2))
         elif view == "country-risk":
             today=r['bucket']//DAY*DAY
@@ -93,6 +94,8 @@ def all_series(metrics, days, view, hourly=False):
         else:
             score,ev=scored.get((r["bucket"],r["country"]),(None,None))
             item.update(risk_score=score,evidence=ev)
+            item.update(joint_coverage=round(100*r['modeled_docs']/n,1),
+                        joint_method='measured' if r['modeled_docs']>=n else 'legacy-estimate')
             item.update(total_docs=int(r["total_docs"]), china_business_docs=int(r["china_business_docs"]),
                         avg_tone=round(r["sum_tone"]/n,2),
                         **{f"{f}_docs": int(r[f"{f}_docs"]) for f in metrics.ER_FIELDS})
@@ -170,12 +173,12 @@ def _build_snapshot(store: Store, ranges):
     hour_history['overview_all'] = metrics.overview(days=9, window=hour_win)['series']
     return {"schema_version": SCHEMA_VERSION, "snapshot_id": uuid.uuid4().hex,
             "created_at": metrics.now().isoformat(), "data_version": store.get_state("data_version", 0),
-            "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v2",
+            "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v3", "model_version": MODEL_VERSION,
             "publisher": {"recent_files": store.recent_files()},
             "params": metrics.params().as_dict(), "metrics": metric_catalog(metrics.params()),
             "codes": metrics.code_reference(), "views": views, "trend_history": trend_history,
             "trend_history_hour": hour_history,
-            "score_trend_definition":{"aggregation":"每个UTC日/小时桶独立评分，非整个展示窗口的汇总分；国家风险动量使用此前30日。", "enterprise":"同一桶内达到样本门槛的国家横截面百分位，参照国家变化会影响跨期比较。"}}
+            "score_trend_definition":{"aggregation":"每个UTC日/小时桶独立评分；动量仅展示新闻量变化，不参与国家风险。", "enterprise":"固定负面领域密度；joint_coverage不足100%的旧历史含联合统计估算。"}}
 
 
 def validate_snapshot(data):

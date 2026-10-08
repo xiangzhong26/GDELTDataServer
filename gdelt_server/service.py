@@ -388,6 +388,7 @@ class Service:
                 "last_ingest_at": self.store.get_state("last_ingest_at"),
                 "data_version": self.store.get_state("data_version", 0),
                 "parameter_version": self.store.get_state("parameter_version", 0),
+                "model_version": self.store.get_state('model_version'),
                 "storage": self.store.stats(), "snapshot": self.snapshots.manifest(),
                 "consumer_receipt": self.store.get_state('consumer_receipt'),
                 "unrecoverable_gap": self.store.get_state("unrecoverable_gap"),

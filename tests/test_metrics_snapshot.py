@@ -26,18 +26,19 @@ def populate(store,tmp_path,recent_ts):
 
 def test_default_formulas_and_rank_reference(store,tmp_path,recent_ts):
     populate(store,tmp_path,recent_ts);m=Metrics(store)
-    assert m.attitude(30)['selected']['attitude_score']==-92
+    assert m.attitude(30)['selected']['attitude_score']==-76.6
     cr=m.country_risk(30)['selected']
-    expected=.35*(100*(1-math.exp(-1/.12)))+.15*25+.1*50
+    expected=.9*100*.833+.1*25*.833
     assert cr['risk_score']==round(expected,1)
     assert not cr['momentum_available']
     er=m.enterprise_risk(30)
-    # Security + economy + negativity score 100; other tied dimensions score 50.
-    assert er['selected']['risk_score']==74.5
-    assert er['percentile_reference_count']==2
+    # Tone=-2 => adverse density .2 for security, economy, negativity; others zero.
+    assert er['selected']['risk_score']==round(100*math.sqrt(.2)*.833*.49,1)
+    assert er['scoring_method']=='fixed-adverse-domain-density'
+    assert er['selected']['joint_coverage']==100
     tiny={('hour',bucket_of(recent_ts,'hour'),'ZZ'):{'total_docs':1,'security_docs':1}}
     store.apply('gkg',recent_ts+SLOT,{'agg_gkg':tiny},1)
-    assert m.enterprise_risk(30)['selected']['risk_score']==74.5
+    assert m.enterprise_risk(30)['selected']['risk_score']==er['selected']['risk_score']
     assert len(m.enterprise_risk(30)['countries'])==2
 
 

@@ -154,7 +154,8 @@ def create_app(settings=None):
     @app.get("/api/gdelt/metrics", dependencies=protected)
     def catalog():
         p = Metrics(app.state.service.store).params()
-        return {"params": p.as_dict(), "metrics": metric_catalog(p)}
+        from .metrics import MODEL_VERSION
+        return {"params": p.as_dict(), "metrics": metric_catalog(p), "model_version": MODEL_VERSION}
 
     @app.get("/api/gdelt/codes", dependencies=protected)
     def codes():
@@ -228,6 +229,9 @@ def create_app(settings=None):
         try:
             p = Params.load(service.store)
             for key, value in body.items():
+                from .metrics import RETIRED_PARAMS
+                if key in RETIRED_PARAMS:
+                    raise ValueError(f'{key}属于旧模型参数，请刷新页面使用v3参数')
                 old = getattr(p, key)
                 if isinstance(old, tuple):
                     if not isinstance(value, list):

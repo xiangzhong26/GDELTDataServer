@@ -25,6 +25,10 @@ GEO_METRICS = ("n_events", "sum_mentions", "sum_sources", "sum_w", "sum_gold_w",
 GKG_METRICS = ("total_docs", "security_docs", "political_docs", "economic_docs",
                "infrastructure_docs", "social_docs", "health_docs", "china_business_docs",
                "sum_tone", "sum_polarity")
+GKG_RISK_FIELDS = ("security", "political", "economic", "infrastructure", "social", "health")
+GKG_METRICS += ("modeled_docs", "sum_modeled_tone", "sum_negative_tone", *(
+    name for field in GKG_RISK_FIELDS
+    for name in (f"{field}_modeled_docs", f"{field}_negative")))
 SPECS = {
     "agg_relation": (REL_METRICS, ("actor1", "actor2", "root_code")),
     "agg_geo": (GEO_METRICS, ("geo_country", "root_code")),
@@ -101,6 +105,10 @@ class Store:
                 db.execute(f"CREATE TABLE IF NOT EXISTS {table} (granularity TEXT NOT NULL, "
                            f"bucket INTEGER NOT NULL, " + ",".join(f"{d} TEXT NOT NULL" for d in dims)
                            + f",{columns},PRIMARY KEY ({','.join(keys)})) WITHOUT ROWID")
+                existing = {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}
+                for metric in metrics:
+                    if metric not in existing:
+                        db.execute(f'ALTER TABLE {table} ADD COLUMN {metric} REAL NOT NULL DEFAULT 0')
                 db.execute(f"CREATE INDEX IF NOT EXISTS ix_{table}_country ON {table} "
                            f"(granularity,{dims[0]},bucket)")
                 if table == "agg_relation":
@@ -124,6 +132,8 @@ class Store:
                 db.execute('UPDATE ingest_file SET retry_attempts=MIN(attempts,?) WHERE attempts>0', (self.max_file_attempts,))
             # Existing failures already over budget become dormant, never silently successful.
             db.execute("UPDATE ingest_file SET status='exhausted',next_retry=0 WHERE status='failed' AND retry_attempts>=?", (self.max_file_attempts,))
+        from .metrics import initialize_model
+        initialize_model(self)
 
     def get_state(self, key, default=None):
         with self.connect() as db:

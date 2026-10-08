@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gdelt_server.metrics import (
-    Params, country_score_components, evidence_docs, evidence_events,
+    Params, country_score_components, evidence_docs, evidence_events, MODEL_VERSION,
     momentum_from_coverage, percentile_scores, saturation,
 )
 from gdelt_server.parser import gkg_categories
@@ -29,20 +29,23 @@ def diagnose():
              "momentum", "total", "evidence")
     roots = {}
     for root in ("15", "17", "19"):
+        strength = {'15': .3, '17': .6, '19': 1.0}[root]
         aggregate = dict(n_events=100, sum_sources=100, sum_w=100, sum_tone=0,
-                         w_sec=100 if root in p.roots_security else 0,
-                         w_soc=100 if root in p.roots_social else 0,
-                         w_pol=100 if root in p.roots_political else 0)
+                         w_sec=100*strength if root in p.roots_security else 0,
+                         w_soc=100*strength if root in p.roots_social else 0,
+                         w_pol=100*strength if root in p.roots_political else 0)
         roots[root] = dict(zip(names, (round(v, 4) for v in
                                      country_score_components(aggregate, p))))
+        roots[root]['input_negative_strength'] = strength
     return {
         "scope": "synthetic examples; default Params; not production country validation",
+        "model_version": MODEL_VERSION,
         "single_root_examples": roots,
-        "security_saturation": {str(r): round(saturation(r, p.scale_security), 4)
+        "legacy_security_saturation": {str(r): round(saturation(r, .12), 4)
                                 for r in (.1, .3, .5, .8)},
         "evidence": {"events_50_sources_50": evidence_events(50, 50, p),
                      "documents_46": evidence_docs(46, p)},
-        "small_difference_percentiles": percentile_scores([.0100, .0101]),
+        "legacy_small_difference_percentiles": percentile_scores([.0100, .0101]),
         "ordinary_theme_categories": gkg_categories("ECON_TRADE;ENERGY;MEDICAL;"),
         "tone_example": {"raw_average": statistics.mean([-100, 9]),
                          "retained_average": round(10 * statistics.mean(

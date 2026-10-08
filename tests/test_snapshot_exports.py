@@ -253,15 +253,15 @@ def test_historical_scores_use_shared_formulas_per_bucket(store,tmp_path,recent_
     assert points[-1]['attitude_score']==overview['summary']['attitude_score']
 
 
-def test_enterprise_history_does_not_mix_percentile_reference_dates():
+def test_enterprise_history_tracks_own_negative_density():
     from gdelt_server.metrics import Params,enterprise_score_components
     fields=('security','political','economic','infrastructure','social','health')
     def row(negative):
         return {'total_docs':100,'sum_tone':-negative*100,**{f+'_docs':0 for f in fields}}
     a=enterprise_score_components({'US':row(1),'RS':row(2)},Params())
     b=enterprise_score_components({'US':row(2),'RS':row(1)},Params())
-    assert a['US'][0]['negativity']==0
-    assert b['US'][0]['negativity']==100
+    assert 0 < a['US'][0]['negativity'] < b['US'][0]['negativity'] < 100
+    assert a['US']==enterprise_score_components({'US':row(1)},Params())['US']
 
 
 def test_hour_history_uses_hourly_coverage_and_precedes_seven_day_view(store,tmp_path,recent_ts):

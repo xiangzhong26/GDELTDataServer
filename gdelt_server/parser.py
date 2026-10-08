@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from .fips_names import CHINA_REGION_CAMEO, CHINA_REGION_FIPS
-from .store import QUAD_DIRECTION,bucket_of,mention_weight,goldstein_unit,tone_unit
+from .store import QUAD_DIRECTION,bucket_of,mention_weight,goldstein_unit,tone_unit,GKG_METRICS
 csv.field_size_limit(16*1024*1024)
 
 def _text(fields: list[str], index: int) -> str:
@@ -271,12 +271,7 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
     def cell(key):
         c = buckets.get(key)
         if c is None:
-            c = buckets[key] = {
-                "total_docs": 0, "security_docs": 0, "political_docs": 0,
-                "economic_docs": 0, "infrastructure_docs": 0, "social_docs": 0,
-                "health_docs": 0, "china_business_docs": 0,
-                "sum_tone": 0.0, "sum_polarity": 0.0,
-            }
+            c = buckets[key] = dict.fromkeys(GKG_METRICS, 0.0)
         return c
 
     with zipfile.ZipFile(payload) as archive:
@@ -315,8 +310,12 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
                 china = int(is_china_business(organizations))
 
                 tone_parts = _text(fields, 15).split(",")
+                if not tone_parts[0].strip():
+                    # Unknown sentiment is not a measured neutral document.
+                    skipped += 1
+                    continue
                 try:
-                    tone = float(tone_parts[0]) if tone_parts and tone_parts[0] else 0.0
+                    tone = float(tone_parts[0])
                     polarity = float(tone_parts[3]) if len(tone_parts) > 3 and tone_parts[3] else 0.0
                 except ValueError as exc:
                     raise ValueError("GKG语调不是合法数字") from exc
@@ -326,8 +325,15 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
                 for code in countries:
                     c = cell(("hour", bucket, code))
                     c["total_docs"] += 1
+                    # Domain and negativity must co-occur in the SAME document.
+                    negative = max(0.0, min(1.0, -tone / 10.0))
+                    c['modeled_docs'] += 1
+                    c['sum_modeled_tone'] += tone
+                    c['sum_negative_tone'] += negative
                     for name in cats:
                         c[f"{name}_docs"] += 1
+                        c[f"{name}_modeled_docs"] += 1
+                        c[f"{name}_negative"] += negative
                     c["china_business_docs"] += china
                     c["sum_tone"] += tone
                     c["sum_polarity"] += polarity
