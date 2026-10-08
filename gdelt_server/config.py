@@ -23,6 +23,7 @@ class Settings(BaseModel):
     max_download_mb: int = Field(128, ge=1, le=1024)
     max_uncompressed_mb: int = Field(1024, ge=1, le=8192)
     request_timeout: int = Field(60, ge=5, le=300)
+    max_file_attempts: int = Field(5, ge=1, le=20, strict=True)
     api_token: str = ""
     snapshot_read_token: str = ""
     snapshot_days: list[int] = Field(default_factory=lambda: [1, 7, 30, 90, 365, 1095])

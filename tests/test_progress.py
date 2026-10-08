@@ -105,7 +105,7 @@ def test_history_progress_is_scoped_and_survives_pause_restart(tmp_path, recent_
         service.store.set_state('paused_backfill', job)
         progress = service.status()['progress']
         assert progress == {'start_ts':recent_ts,'end_ts':recent_ts+4*SLOT,'total':8,'done':1,
-            'pending':6,'failed':1,'unseeded':0,'percent':12.5,'paused':True}
+            'pending':6,'failed':1,'exhausted':0,'unseeded':0,'percent':12.5,'paused':True,'work_finished':False}
     finally:
         service.ingestor.close()
     restarted = Service(settings)

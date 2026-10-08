@@ -17,7 +17,7 @@ LOG = logging.getLogger(__name__)
 class Service:
     def __init__(self, settings):
         self.settings = settings = settings.model_copy(deep=True)
-        self.store = Store(settings.data_dir/"gdelt.db")
+        self.store = Store(settings.data_dir/"gdelt.db", settings.max_file_attempts)
         self.store.initialize()
         self.queries = QueryCache(self.store)
         self.runtime_error = None
@@ -39,17 +39,20 @@ class Service:
         self.shutdown = threading.Event()
         self.wake = threading.Event()
         self.control = threading.Lock()
-        self.job = self.store.get_state("active_backfill")
+        self.job = self.store.get_state("active_backfill") or self.store.get_state('active_repair')
         self.paused_backfill = self.store.get_state('paused_backfill')
-        if self.job and 'end_ts' not in self.job:
+        if self.job and self.job['action'] == 'backfill' and 'end_ts' not in self.job:
             horizon = int(utcnow().timestamp())//SLOT*SLOT
             self.job.setdefault('start_ts', horizon-self.job['hours']*3600)
             self.job['end_ts'] = horizon
             self.store.set_state('active_backfill', self.job)
         if self.job and self.job.get('paused'):
-            self.paused_backfill = self.job
-            self.store.set_state('paused_backfill', self.job)
-            self.store.set_state('active_backfill', None)
+            if self.job['action'] == 'backfill':
+                self.paused_backfill = self.job
+                self.store.set_state('paused_backfill', self.job)
+                self.store.set_state('active_backfill', None)
+            else:
+                self.store.set_state('active_repair', None)
             self.job = None
         self.last_job = None
         self.last_export = 0.
@@ -95,11 +98,24 @@ class Service:
                 self.paused_backfill = self.job
                 self.store.set_state('paused_backfill', self.job)
                 self.store.set_state('active_backfill', None)
+            elif self.job and self.job['action'] == 'repair':
+                self.job['paused'] = True
+                self.store.set_state('active_repair', None)
             self.wake.set()
         return {'accepted': True, 'reason': '全部采集正在暂停，已完成进度已保存；不会再提交新文件'}
 
     def request(self, action, hours=None, start_date=None):
         with self.control:
+            if action == 'repair':
+                if self.job:
+                    return {'accepted': False, 'reason': '已有任务在运行；请等待结束，或先暂停全部并等待在途文件收尾后，再点击查缺补漏'}
+                # Queue during a monitoring batch; reset budgets only after its files finish.
+                repair_job = {'action': 'repair'}
+                self.store.set_state('active_repair', repair_job)
+                self.job = repair_job
+                self.ingestor.cancel.clear()
+                self.wake.set()
+                return {'accepted': True, 'job': self.job, 'reason': f'查缺补漏已提交，在途文件收尾后为失败文件开启新一轮，每个文件最多尝试{self.settings.max_file_attempts}次'}
             if self.job or self.ingestor.busy.locked():
                 if action == 'retry' and self.job and self.job['action'] == 'backfill' and not self.job.get('paused'):
                     self.store.retry_failed()
@@ -173,6 +189,10 @@ class Service:
         return {'accepted': True, 'job': self.job}
 
     def work_options(self, job=None):
+        if job and job['action'] == 'repair':
+            # Manual repair may retry failures inside paused history, but never resumes
+            # that history's unprocessed pending files.
+            return {'failed_only': True}
         if job and job['action'] == 'backfill':
             opts = {'descending': True}
             if not self.enabled:
@@ -189,7 +209,7 @@ class Service:
         with self.control:
             self.enabled = enabled
             self.store.set_state("monitor_enabled", enabled)
-            if not enabled and not (self.job and self.job['action'] == 'backfill'):
+            if not enabled and not (self.job and self.job['action'] in ('backfill','repair')):
                 self.ingestor.stop()
             elif enabled and not (self.job and self.job.get('paused')):
                 self.ingestor.cancel.clear()
@@ -238,6 +258,11 @@ class Service:
                     with self.ingestor.busy:
                         result = self.export_locked()
                 elif enabled or job:
+                    if job and job['action'] == 'repair' and not job.get('seeded'):
+                        with self.control:
+                            if not job.get('paused') and not self.ingestor.cancel.is_set():
+                                job['reopened_files'] = self.store.reopen_failed(job)
+                                job['seeded'] = True
                     if job and job['action'] == 'retry' and not job.get('seeded'):
                         job['scheduled_files'] = self.ingestor.repair_gaps()
                         job['seeded'] = True
@@ -254,9 +279,12 @@ class Service:
                     if should_run:
                         result = self.ingestor.run_once(schedule=enabled or bool(job and job["action"] == "sync"),
                                                        clear_cancel=False, **self.work_options(job))
+                        if job and job['action'] == 'repair' and enabled and not self.ingestor.cancel.is_set():
+                            # Keep live monitoring moving while manual failures back off.
+                            self.ingestor.run_once(schedule=True, clear_cancel=False, **self.work_options())
                 if job:
                     scope = {'ranges': [(job['start_ts'], job['end_ts'])]} if job['action'] == 'backfill' else {k:v for k,v in self.work_options(job).items() if k != 'descending'}
-                    more = (job["action"] in ('backfill', 'retry') and self.store.has_unfinished(**scope)
+                    more = (job["action"] in ('backfill', 'retry', 'repair') and self.store.has_unfinished(**scope)
                             and not self.ingestor.cancel.is_set())
                     if not more and not self.shutdown.is_set():
                         # Force a final publish, even if the last partial batch was throttled.
@@ -270,6 +298,9 @@ class Service:
                                     self.paused_backfill = job
                                     self.store.set_state('paused_backfill', job)
                                 self.store.set_state("active_backfill", None)
+                                self.store.set_state('last_backfill', self.last_job)
+                            if job['action'] == 'repair':
+                                self.store.set_state('active_repair', None)
                             self.job = None
                             self.ingestor.cancel.clear()
             except Exception as exc:
@@ -327,7 +358,7 @@ class Service:
 
     def status(self):
         job = dict(self.job or self.paused_backfill or
-                   (self.last_job if self.last_job and self.last_job.get('action') == 'backfill' else {}) or {})
+                   (self.last_job if self.last_job and self.last_job.get('action') == 'backfill' else {}) or self.store.get_state('last_backfill', {}))
         progress = None
         if job.get('action') == 'backfill':
             start, end = job['start_ts'], job['end_ts']
@@ -338,9 +369,11 @@ class Service:
             done = counts.get('done', 0)
             progress = {'start_ts':start, 'end_ts':end, 'total':total, 'done':done,
                         'pending':counts.get('pending', 0), 'failed':counts.get('failed', 0),
+                        'exhausted':counts.get('exhausted', 0),
                         'unseeded':max(0, total-sum(counts.values())),
                         'percent':round(done/total*100, 2) if total else 100,
                         'paused':bool(job.get('paused'))}
+            progress['work_finished'] = not (progress['pending'] or progress['failed'] or progress['unseeded'])
         return {"monitor_enabled": self.enabled, "running": self.enabled and self.thread.is_alive(),
                 "progress": progress, "next_run_at": self.next_run_at,
                 "phase": self.ingestor.phase, "busy": self.ingestor.busy.locked(),
@@ -357,5 +390,6 @@ class Service:
                 "storage": self.store.stats(), "snapshot": self.snapshots.manifest(),
                 "unrecoverable_gap": self.store.get_state("unrecoverable_gap"),
                 "poll_seconds": self.settings.poll_seconds,
+                "max_file_attempts": self.settings.max_file_attempts,
                 "day_retention_days": self.settings.day_retention_days,
                 "hour_retention_days": self.settings.hour_retention_days}

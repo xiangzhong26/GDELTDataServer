@@ -340,7 +340,7 @@ class Ingestor:
             if path is not None:
                 path.unlink(missing_ok=True)
 
-    def run_once(self, schedule=True, limit=None, clear_cancel=True, ranges=None, exclude_range=None, descending=False):
+    def run_once(self, schedule=True, limit=None, clear_cancel=True, ranges=None, exclude_range=None, descending=False, failed_only=False):
         if not self.busy.acquire(blocking=False):
             return {"skipped": "已有同步或快照任务运行中"}
         done = failed = 0
@@ -361,7 +361,7 @@ class Ingestor:
                 self.schedule()
             self.check_disk()
             pending = self.store.pending(limit or max(self.settings.batch_files, self.settings.download_workers), ranges=ranges,
-                                         exclude_range=exclude_range, descending=descending)
+                                         exclude_range=exclude_range, descending=descending, failed_only=failed_only)
             scheduling_seconds = time.monotonic()-started
             with self.active_lock:
                 self.cycle['total'] = len(pending)

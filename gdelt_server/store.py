@@ -54,8 +54,9 @@ def tone_unit(v):
 
 
 class Store:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, max_file_attempts=5):
         self.path = Path(path)
+        self.max_file_attempts = max_file_attempts
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
@@ -116,6 +117,12 @@ class Store:
                 CREATE INDEX IF NOT EXISTS ix_file_time ON ingest_file(kind,file_ts,status);
                 CREATE INDEX IF NOT EXISTS ix_file_work ON ingest_file(status,file_ts);
             """)
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(ingest_file)')}
+            if 'retry_attempts' not in columns:
+                db.execute('ALTER TABLE ingest_file ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0')
+                db.execute('UPDATE ingest_file SET retry_attempts=MIN(attempts,?) WHERE attempts>0', (self.max_file_attempts,))
+            # Existing failures already over budget become dormant, never silently successful.
+            db.execute("UPDATE ingest_file SET status='exhausted',next_retry=0 WHERE status='failed' AND retry_attempts>=?", (self.max_file_attempts,))
 
     def get_state(self, key, default=None):
         with self.connect() as db:
@@ -138,7 +145,7 @@ class Store:
         with self.connect(write=True) as db:
             before = db.total_changes
             db.executemany("INSERT INTO ingest_file(kind,file_ts) VALUES (?,?) "
-                           "ON CONFLICT(kind,file_ts) DO UPDATE SET status='pending',attempts=0,next_retry=0,error=NULL "
+                           "ON CONFLICT(kind,file_ts) DO UPDATE SET status='pending',attempts=0,retry_attempts=0,next_retry=0,error=NULL "
                            "WHERE ingest_file.status='expired'",
                            ((kind, ts) for ts in range(start, end, SLOT) for kind in ("events", "gkg")))
             count = db.total_changes - before
@@ -147,8 +154,10 @@ class Store:
         return count
 
     @staticmethod
-    def work_filter(ranges=None, exclude_range=None):
+    def work_filter(ranges=None, exclude_range=None, failed_only=False):
         clauses, args = [], []
+        if failed_only:
+            clauses.append("status='failed'")
         if ranges is not None:
             parts = []
             for start, end in ranges:
@@ -162,12 +171,12 @@ class Store:
             args.extend(exclude_range)
         return ''.join(' AND '+c for c in clauses), args
 
-    def pending(self, limit, now=None, ranges=None, exclude_range=None, descending=False):
+    def pending(self, limit, now=None, ranges=None, exclude_range=None, descending=False, failed_only=False):
         now = now if now is not None else int(utcnow().timestamp())
         if limit <= 0:
             return []
         with self.connect() as db:
-            scope, scope_args = self.work_filter(ranges, exclude_range)
+            scope, scope_args = self.work_filter(ranges, exclude_range, failed_only)
             order = 'DESC' if descending else 'ASC'
             # Reserve part of each batch for retries and recent files, so a multi-year
             # history queue cannot starve live updates or indefinitely defer failures.
@@ -187,21 +196,23 @@ class Store:
         now = int(utcnow().timestamp())
         with self.connect(write=True) as db:
             db.execute("INSERT OR IGNORE INTO ingest_file(kind,file_ts) VALUES (?,?)", (kind, ts))
-            row = db.execute("SELECT attempts,status FROM ingest_file WHERE kind=? AND file_ts=?", (kind, ts)).fetchone()
-            if row["status"] == "done":
+            row = db.execute("SELECT attempts,retry_attempts,status FROM ingest_file WHERE kind=? AND file_ts=?", (kind, ts)).fetchone()
+            if row["status"] in ('done','exhausted'):
                 return
             attempt = row["attempts"] + 1
-            delay = min(21600, 60 * 2 ** min(attempt, 9))
-            db.execute("UPDATE ingest_file SET status='failed',attempts=?,next_retry=?,error=? WHERE kind=? AND file_ts=?",
-                       (attempt, now + delay, str(error)[:1000], kind, ts))
+            round_attempt = row['retry_attempts'] + 1
+            exhausted = round_attempt >= self.max_file_attempts
+            delay = min(21600, 60 * 2 ** min(round_attempt, 9))
+            db.execute("UPDATE ingest_file SET status=?,attempts=?,retry_attempts=?,next_retry=?,error=? WHERE kind=? AND file_ts=?",
+                       ('exhausted' if exhausted else 'failed', attempt, round_attempt, 0 if exhausted else now + delay, str(error)[:1000], kind, ts))
 
-    def has_unfinished(self, ranges=None, exclude_range=None):
-        scope, args = self.work_filter(ranges, exclude_range)
+    def has_unfinished(self, ranges=None, exclude_range=None, failed_only=False):
+        scope, args = self.work_filter(ranges, exclude_range, failed_only)
         with self.connect() as db:
             return db.execute("SELECT 1 FROM ingest_file WHERE status IN ('pending','failed')"+scope+" LIMIT 1", args).fetchone() is not None
 
-    def retry_delay(self, ranges=None, exclude_range=None):
-        scope, args = self.work_filter(ranges, exclude_range)
+    def retry_delay(self, ranges=None, exclude_range=None, failed_only=False):
+        scope, args = self.work_filter(ranges, exclude_range, failed_only)
         with self.connect() as db:
             ts = db.execute("SELECT MIN(next_retry) FROM ingest_file WHERE status IN ('pending','failed')"+scope, args).fetchone()[0]
         return max(2, ts-int(utcnow().timestamp())) if ts is not None else 900
@@ -209,6 +220,14 @@ class Store:
     def retry_failed(self):
         with self.connect(write=True) as db:
             return db.execute("UPDATE ingest_file SET next_retry=0 WHERE status='failed'").rowcount
+
+    def reopen_failed(self, repair_job=None):
+        """Only explicit gap repair starts a new bounded attempt round."""
+        with self.connect(write=True) as db:
+            count = db.execute("UPDATE ingest_file SET status='failed',retry_attempts=0,next_retry=0 WHERE status IN ('failed','exhausted')").rowcount
+            if repair_job is not None:
+                self._state(db, 'active_repair', {**repair_job, 'seeded': True, 'reopened_files': count})
+            return count
 
     def apply(self, kind, ts, tables, rows, skipped=0):
         """Commit file ledger and direct daily/hourly contributions together."""
@@ -283,7 +302,7 @@ class Store:
             # Only expire completed files after BOTH aggregate granularities are removed.
             # Keeping 'done' would prevent safe restoration after retention is expanded.
             db.execute("UPDATE ingest_file SET status='expired',error='批次超出聚合保留期' "
-                       "WHERE status IN ('pending','failed','done') AND file_ts<?", (now-max(hour_days, day_days)*DAY,))
+                       "WHERE status IN ('pending','failed','exhausted','done') AND file_ts<?", (now-max(hour_days, day_days)*DAY,))
             if any(deleted.values()):
                 version = db.execute("SELECT value FROM gdelt_state WHERE key='data_version'").fetchone()
                 self._state(db, 'data_version', (json.loads(version[0]) if version else 0)+1)
@@ -297,7 +316,7 @@ class Store:
         with self.connect() as db:
             ledger = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM ingest_file GROUP BY status")}
             latest = {r["kind"]: r["ts"] for r in db.execute("SELECT kind,MAX(file_ts) ts FROM ingest_file WHERE status='done' GROUP BY kind")}
-            errors = [dict(r) for r in db.execute("SELECT kind,file_ts,attempts,error,next_retry FROM ingest_file WHERE status='failed' ORDER BY file_ts DESC LIMIT 8")]
+            errors = [dict(r) for r in db.execute("SELECT kind,file_ts,status,attempts,retry_attempts,error,next_retry FROM ingest_file WHERE status IN ('failed','exhausted') ORDER BY file_ts DESC LIMIT 8")]
             pages = db.execute("PRAGMA page_count").fetchone()[0]
             free = db.execute("PRAGMA freelist_count").fetchone()[0]
             counts = db.execute("SELECT COALESCE(SUM(row_count),0) parsed,COALESCE(SUM(skipped_rows),0) skipped "

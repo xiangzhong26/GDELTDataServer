@@ -189,6 +189,10 @@ def create_app(settings=None):
     def retry():
         return app.state.service.request('retry')
 
+    @app.post('/api/admin/repair', dependencies=protected)
+    def repair():
+        return app.state.service.request('repair')
+
     @app.post("/api/admin/backfill", dependencies=protected)
     def backfill(body: BackfillBody):
         try:
