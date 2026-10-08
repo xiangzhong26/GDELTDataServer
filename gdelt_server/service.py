@@ -25,6 +25,7 @@ class Service:
                                           self.store.get_state("backfill_retention_days", 0), 1185)
         # Upgrade existing installations without requiring manual config edits.
         settings.snapshot_days = sorted(set(settings.snapshot_days) | {1, 1095})
+        settings.hour_retention_days = max(9, settings.hour_retention_days)
         saved = self.store.get_state('concurrency_settings')
         if saved:
             from .config import Settings
@@ -388,6 +389,7 @@ class Service:
                 "data_version": self.store.get_state("data_version", 0),
                 "parameter_version": self.store.get_state("parameter_version", 0),
                 "storage": self.store.stats(), "snapshot": self.snapshots.manifest(),
+                "consumer_receipt": self.store.get_state('consumer_receipt'),
                 "unrecoverable_gap": self.store.get_state("unrecoverable_gap"),
                 "poll_seconds": self.settings.poll_seconds,
                 "max_file_attempts": self.settings.max_file_attempts,

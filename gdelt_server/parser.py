@@ -18,10 +18,45 @@ def _text(fields: list[str], index: int) -> str:
 
 
 def _int(fields: list[str], index: int, default: int = 0) -> int:
-    try:
-        return int(float(_text(fields, index) or default))
-    except ValueError:
+    value = _text(fields, index)
+    if not value:
         return default
+    number = float(value)
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError('Events计数字段不是有限整数')
+    return int(number)
+
+
+def gkg_records(stream, cancel=None):
+    """Only the unconsumed XML extras field may continue onto physical lines.
+
+    Never discard a short core record or interpret it as a zero-valued document.
+    The buffered extras are bounded, and cancellation is checked on every line.
+    """
+    previous = None
+    extra_size = 0
+    for fields in csv.reader(stream, delimiter='\t', quoting=csv.QUOTE_NONE):
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError('解析已暂停，未提交批次保留待处理')
+        if len(fields) >= 27:
+            if previous is not None:
+                yield previous
+            previous = fields
+            extra_size = 0
+        elif (previous is not None and len(fields) <= 1
+              and re.fullmatch(r'\d{14}-\d+', previous[0])
+              and '<PAGE_LINKS>' in previous[26]
+              and '</PAGE_TITLE>' not in previous[26]
+              and not (fields and re.match(r'^\d{14}-\d+', fields[0]))):
+            tail = fields[0] if fields else ''
+            extra_size += len(tail)
+            if extra_size > 1024 * 1024:
+                raise ValueError('GKG XML换行内容超过1MB')
+            previous[26] += '\n' + tail
+        else:
+            raise ValueError(f'未知GKG列布局：{len(fields)}列')
+    if previous is not None:
+        yield previous
 
 
 def _num(fields: list[str], index: int) -> float | None:
@@ -136,7 +171,7 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, c
         with archive.open(names[0]) as stream:
             wrapper = io.TextIOWrapper(stream, encoding="utf-8",
                                        errors="replace", newline="")
-            for fields in csv.reader(wrapper, delimiter="\t"):
+            for fields in csv.reader(wrapper, delimiter="\t", quoting=csv.QUOTE_NONE):
                 if cancel is not None and cancel.is_set():
                     raise InterruptedError('解析已暂停，未提交批次保留待处理')
                 if len(fields) not in (58, 61):
@@ -178,6 +213,13 @@ def parse_events(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, c
                     continue
                 if root_code not in {f"{i:02d}" for i in range(1,21)} or quad not in (1,2,3,4):
                     raise ValueError("Events事件大类或四分类不合法")
+                if (gold is None and _text(fields, 30)) or (tone is None and _text(fields, 34)):
+                    raise ValueError("Events数值字段缺失或不合法")
+                if (not _text(fields, 30) or not _text(fields, 34)) and min(mentions, sources, articles) >= 0:
+                    # Official records with an absent score input cannot be scored.
+                    # Skip the record, report it in the ledger, retain the valid batch.
+                    skipped += 1
+                    continue
                 if gold is None or tone is None or min(mentions, sources, articles) < 0:
                     raise ValueError("Events数值字段缺失或不合法")
 
@@ -245,7 +287,7 @@ def parse_gkg(payload: Path, file_ts: int, max_uncompressed_mb: int = 1024, canc
         with archive.open(names[0]) as stream:
             wrapper = io.TextIOWrapper(stream, encoding="utf-8",
                                        errors="replace", newline="")
-            for fields in csv.reader(wrapper, delimiter="\t"):
+            for fields in gkg_records(wrapper, cancel):
                 if cancel is not None and cancel.is_set():
                     raise InterruptedError('解析已暂停，未提交批次保留待处理')
                 if len(fields) < 27:

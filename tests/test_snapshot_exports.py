@@ -196,7 +196,7 @@ def test_configure_sync_refuses_environment_credential_conflict(tmp_path, monkey
 def test_snapshot_exports_extra_daily_history_for_short_windows(store,monkeypatch):
     import gdelt_server.snapshot as module
     calls=[]
-    def series(metrics,days,name):
+    def series(metrics,days,name, hourly=False):
         calls.append((days,name))
         return {'USA':[{'bucket':0,'timestamp':'1970-01-01T00:00:00Z','complete':True,'event_count':2}]}
     monkeypatch.setattr(module,'all_series',series)
@@ -205,13 +205,15 @@ def test_snapshot_exports_extra_daily_history_for_short_windows(store,monkeypatc
     assert len(snapshot['trend_history']['overview_all'])==455
     assert all('attitude_score' in p for p in snapshot['trend_history']['overview_all'])
     assert snapshot['schema_version']==1
+    assert (9, 'country-risk') in calls
+    assert set(snapshot['trend_history_hour']) == {'attitude','country-risk','enterprise-risk','overview_all'}
 
 
 def test_three_year_window_and_realtime_are_published_with_history(store,monkeypatch):
     import gdelt_server.snapshot as module
     from gdelt_server.metrics import make_window
     calls=[]
-    def series(metrics,days,name):
+    def series(metrics,days,name, hourly=False):
         calls.append((days,name))
         return {}
     monkeypatch.setattr(module,'all_series',series)
@@ -260,3 +262,19 @@ def test_enterprise_history_does_not_mix_percentile_reference_dates():
     b=enterprise_score_components({'US':row(2),'RS':row(1)},Params())
     assert a['US'][0]['negativity']==0
     assert b['US'][0]['negativity']==100
+
+
+def test_hour_history_uses_hourly_coverage_and_precedes_seven_day_view(store,tmp_path,recent_ts):
+    from test_metrics_snapshot import populate
+    populate(store,tmp_path,recent_ts)
+    snapshot=build_snapshot(store,[1,7,30])
+    hour=snapshot['trend_history_hour']
+    for name,code in [('attitude','USA'),('country-risk','US'),('enterprise-risk','US')]:
+        points=hour[name][code]
+        assert len(points)==216
+        assert points[1]['bucket']-points[0]['bucket']==3600
+        assert snapshot['views']['7'][name]['series_by_country'][code][0]['bucket']-points[0]['bucket']==48*3600
+        assert all(p['risk_score'] is None for p in points if not p['collected_files']) if name.endswith('risk') else True
+    global_points=hour['overview_all']
+    assert len(global_points)==216
+    assert all(p['attitude_score'] is None and p['event_count'] is None for p in global_points if not p['collected_files'])

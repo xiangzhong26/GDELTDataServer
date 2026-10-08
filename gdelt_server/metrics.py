@@ -771,9 +771,9 @@ class BaseMetrics:
     # ========================================================
 
     def overview(self, days: int = 7, view: str = "china",
-                 country: str = "USA") -> dict[str, Any]:
+                 country: str = "USA", window: Window | None = None) -> dict[str, Any]:
         p = self.params()
-        win = self.window(days)
+        win = window or self.window(days)
         country = (country or "USA").upper()
 
         if view == "china":
@@ -1003,14 +1003,14 @@ class Metrics(BaseMetrics):
         coverage = cache[key]
         return momentum_from_coverage(day_counts,today,p,start,coverage)
 
-    def decorate(self, result, days, source, fields):
-        win = self.window(days)
+    def decorate(self, result, days, source, fields, window=None):
+        win = window or self.window(days)
         coverage = self.store.coverage(source, win.start, win.end)
         buckets = self.store.coverage_buckets(source, win.start, win.end, win.size)
         result["coverage"] = coverage
         result["data_version"] = self.store.get_state("data_version", 0)
         result["parameter_version"] = self.store.get_state("parameter_version", 0)
-        result["parser_version"] = "aggregate-v1"
+        result["parser_version"] = "aggregate-v2"
         result["window"].update(start=_iso(win.start), end=_iso(win.end), timezone="UTC",
                                 definition="含当前未完整桶的最近自然日/小时桶")
         for point in result.get("series", []):
@@ -1025,9 +1025,9 @@ class Metrics(BaseMetrics):
         result["quality_note"] = "证据充分度衡量样本量，时间覆盖率单独显示；缺采集点为空，部分采集点标记为不完整。"
         return result
 
-    def overview(self, days=7, view="china", country="USA"):
-        return self.decorate(super().overview(days, view, country), days, "events",
-                             ("event_count", "mentions", "attitude_score", "avg_goldstein", "avg_tone"))
+    def overview(self, days=7, view="china", country="USA", window=None):
+        return self.decorate(super().overview(days, view, country, window), days, "events",
+                             ("event_count", "mentions", "attitude_score", "avg_goldstein", "avg_tone"), window)
 
     def attitude(self, days=30, country="USA"):
         return self.decorate(super().attitude(days, country), days, "events",

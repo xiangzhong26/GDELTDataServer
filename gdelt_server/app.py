@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import fields
-from datetime import date
+from datetime import date, datetime, timezone
 import hmac
 import json
 import logging
@@ -18,6 +18,11 @@ from .config import Settings
 from .instance import InstanceLock
 from .metrics import Metrics, Params, metric_catalog, validate_params
 from .service import Service
+
+
+class SnapshotReceipt(BaseModel):
+    snapshot_id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
+    sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
 
 
 def authorize(settings, request, authorization):
@@ -250,14 +255,62 @@ def create_app(settings=None):
 
     @app.get("/api/snapshots/latest", dependencies=snapshot_protected)
     def manifest(if_none_match: str = Header(default='')):
-        value = app.state.service.snapshots.manifest()
+        source = app.state.service
+        value = source.snapshots.manifest()
         if not value:
             raise HTTPException(404, "尚未生成快照")
         etag = '"'+value['sha256']+'"'
-        headers = {'ETag':etag, 'Cache-Control':'no-cache'}
+        headers = {'ETag':etag, 'Cache-Control':'no-cache',
+                   'X-GDELT-Monitor': '1' if source.enabled else '0',
+                   'X-GDELT-Phase': source.ingestor.phase,
+                   'X-GDELT-Job': (source.job or {}).get('action', ''),
+                   'X-GDELT-Worker': '1' if source.thread.is_alive() else '0',
+                   'X-GDELT-Data-Version': str(source.store.get_state('data_version', 0)),
+                   'X-GDELT-Last-Ingest': str(source.store.get_state('last_ingest_at') or '')}
         if any(tag.strip() in (etag, 'W/'+etag, '*') for tag in if_none_match.split(',')):
             return Response(status_code=304, headers=headers)
         return JSONResponse(value, headers=headers)
+
+    @app.post('/api/snapshots/receipt', dependencies=snapshot_protected)
+    def receipt(body: SnapshotReceipt):
+        source = app.state.service
+        try:
+            value = source.snapshots.version_manifest(body.snapshot_id)
+        except FileNotFoundError:
+            raise HTTPException(404, '该版本已过保留期')
+        if not hmac.compare_digest(value['sha256'], body.sha256):
+            raise HTTPException(409, '版本校验值不符')
+        source.store.set_state('consumer_receipt', {
+            'snapshot_id': body.snapshot_id, 'data_version': value['data_version'],
+            'received_at': datetime.now(timezone.utc).isoformat()})
+        return {'accepted': True}
+
+    @app.get('/api/snapshots/versions/{snapshot_id}/chunks/{digest}', dependencies=snapshot_protected)
+    def chunk(snapshot_id: str, digest: str):
+        try:
+            value, stream = app.state.service.snapshots.open_download(snapshot_id)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, '指定版本不存在')
+        part = next((p for p in value.get('chunks', []) if p['sha256'] == digest), None)
+        if part is None:
+            stream.close()
+            raise HTTPException(404, '指定分块不存在')
+        def blocks():
+            try:
+                stream.seek(part['offset'])
+                remaining = part['bytes']
+                while remaining:
+                    block = stream.read(min(remaining, 256 * 1024))
+                    if not block:
+                        raise OSError('分块文件被截断')
+                    remaining -= len(block)
+                    yield block
+            finally:
+                stream.close()
+        return StreamingResponse(blocks(), media_type='application/gzip',
+            background=BackgroundTask(stream.close), headers={
+                'Content-Length': str(part['bytes']), 'X-SHA256': digest,
+                'X-Snapshot-ID': value['snapshot_id'], 'Cache-Control': 'private, no-store'})
 
     def download_version(snapshot_id=None):
         files = app.state.service.snapshots

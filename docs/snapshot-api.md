@@ -72,3 +72,15 @@ GDELTDataServer下载并计算数据，DSI只获取计算结果。以下三个GE
 7. 任何步骤失败都保留原结果；记录错误并重试。手动与定时同步共用一把锁。
 
 DSI项目已实现定时拉取、管理页面与AI结果缓存适配。frp需要两端分别手动执行deploy/setup-frp.py安装，下载显示进度条；具体步骤见本项目README和DSI的docs/gdelt-sync.md。frp配置应只转发快照读取入口，优先使用HTTPS或受保护的隧道；不要把整个管理工作台直接暴露为同步入口。
+
+
+## 可选分块与接收回执（兼容schema 1）
+
+manifest的可选 `chunks` 按offset连续覆盖整个gzip文件，每项 `{sha256, offset, bytes}` 均针对压缩字节。独立gzip成员拼接后解压得到原JSON。读取接口：
+
+- `GET /api/snapshots/versions/{snapshot_id}/chunks/{sha256}`：需要snapshot_read_token，返回该版本指定压缩块，附X-Snapshot-ID、X-SHA256与Content-Length；不接受外部下载地址。过期版本或不存在的块404。
+- `POST /api/snapshots/receipt`：同一只读结果令牌，body为snapshot_id及sha256。只在接收端校验并成功保存后调用。哈希错误409，过期版本404，成功记录接收时间/版本，不触发采集、计算或参数修改。
+
+latest的200/304均附X-GDELT-Monitor（0/1）、X-GDELT-Phase、X-GDELT-Job（当前历史任务）、X-GDELT-Worker（后台线程）、X-GDELT-Data-Version、X-GDELT-Last-Ingest供小型状态检查。publish内容中的publisher.recent_files最多12条成功批次，字段kind、file_ts、done_at、row_count、skipped_rows。trend_history_hour提供最多216个小时点，日趋势历史不变。
+
+消费者可以按压缩哈希从当前有效文件复用块，对每块与最终完整文件做SHA256校验；任何错误必须保留旧版本。旧版manifest缺chunks时完整下载。接收回执失败不能撤销已经成功保存的数据，旧版发布端不支持回执时也继续提供结果。

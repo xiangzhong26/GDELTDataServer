@@ -116,6 +116,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS ix_file_pending ON ingest_file(status,next_retry,file_ts);
                 CREATE INDEX IF NOT EXISTS ix_file_time ON ingest_file(kind,file_ts,status);
                 CREATE INDEX IF NOT EXISTS ix_file_work ON ingest_file(status,file_ts);
+                CREATE INDEX IF NOT EXISTS ix_file_done ON ingest_file(status,done_at DESC,file_ts DESC);
             """)
             columns = {r['name'] for r in db.execute('PRAGMA table_info(ingest_file)')}
             if 'retry_attempts' not in columns:
@@ -312,6 +313,12 @@ class Store:
             db.execute("PRAGMA incremental_vacuum(2000)")
         return deleted
 
+    def recent_files(self):
+        with self.connect() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT kind,file_ts,done_at,row_count,skipped_rows FROM ingest_file "
+                "WHERE status='done' ORDER BY done_at DESC,file_ts DESC,kind LIMIT 12")]
+
     def stats(self):
         with self.connect() as db:
             ledger = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM ingest_file GROUP BY status")}
@@ -323,7 +330,7 @@ class Store:
                                 "FROM ingest_file WHERE status='done'").fetchone()
         files = [self.path, Path(str(self.path)+"-wal"), Path(str(self.path)+"-shm")]
         usage = shutil.disk_usage(self.path.parent)
-        return {"ledger": ledger, "latest": latest, "errors": errors,
+        return {"ledger": ledger, "latest": latest, "errors": errors, "recent_files": self.recent_files(),
                 "database_bytes": sum(p.stat().st_size for p in files if p.exists()),
                 "free_disk_bytes": usage.free, "free_page_ratio": free/pages if pages else 0,
                 "raw_data_retained": False, "parsed_rows": counts["parsed"], "skipped_rows": counts["skipped"]}

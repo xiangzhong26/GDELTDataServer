@@ -14,8 +14,9 @@ import zlib
 from datetime import datetime
 
 from .metrics import Metrics, metric_catalog, _fill_series, _iso, _safe_div, country_score_components, enterprise_score_components, momentum_from_coverage, is_china_region
-from .store import Store, DAY, utcnow
+from .store import Store, DAY, HOUR, utcnow
 from .series_codec import pack_series, expand_series
+from .chunk_transport import compress_chunks
 
 SCHEMA_VERSION = 1
 MAX_UNPACKED = 256*1024**2
@@ -36,9 +37,11 @@ def encode_json(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 
-def all_series(metrics, days, view):
+def all_series(metrics, days, view, hourly=False):
     """One grouped scan per view; do not recalculate each country's full ranking."""
     win, p = metrics.window(days), metrics.params()
+    if hourly:
+        win = win.__class__(days, 'hour', 'hour', win.end // HOUR * HOUR - (days * 24 - 1) * HOUR, win.end)
     if view == "attitude":
         table, group, sums = "agg_relation", "actor1,bucket", metrics._REL_SUMS
         where = "actor2='CHN' AND actor1<>'CHN'"
@@ -160,11 +163,19 @@ def _build_snapshot(store: Store, ranges):
         'overview_all': global_history,
         'country-risk': all_series(metrics, history_days, 'country-risk'),
         'enterprise-risk': all_series(metrics, history_days, 'enterprise-risk')}
+    hour_win = metrics.window(7)
+    hour_win = hour_win.__class__(9, 'hour', 'hour', hour_win.end // HOUR * HOUR - (9 * 24 - 1) * HOUR, hour_win.end)
+    hour_history = {name: all_series(metrics, 9, name, hourly=True)
+                    for name in ('attitude', 'country-risk', 'enterprise-risk')}
+    hour_history['overview_all'] = metrics.overview(days=9, window=hour_win)['series']
     return {"schema_version": SCHEMA_VERSION, "snapshot_id": uuid.uuid4().hex,
             "created_at": metrics.now().isoformat(), "data_version": store.get_state("data_version", 0),
-            "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v1",
+            "parameter_version": store.get_state("parameter_version", 0), "parser_version": "aggregate-v2",
+            "publisher": {"recent_files": store.recent_files()},
             "params": metrics.params().as_dict(), "metrics": metric_catalog(metrics.params()),
-            "codes": metrics.code_reference(), "views": views, "trend_history": trend_history, "score_trend_definition":{"aggregation":"每个UTC日/小时桶独立评分，非整个展示窗口的汇总分；国家风险动量使用此前30日。", "enterprise":"同一桶内达到样本门槛的国家横截面百分位，参照国家变化会影响跨期比较。"}}
+            "codes": metrics.code_reference(), "views": views, "trend_history": trend_history,
+            "trend_history_hour": hour_history,
+            "score_trend_definition":{"aggregation":"每个UTC日/小时桶独立评分，非整个展示窗口的汇总分；国家风险动量使用此前30日。", "enterprise":"同一桶内达到样本门槛的国家横截面百分位，参照国家变化会影响跨期比较。"}}
 
 
 def validate_snapshot(data):
@@ -226,11 +237,12 @@ class SnapshotFiles:
         raw = encode_json(pack_series(data))
         if len(raw) > MAX_UNPACKED:
             raise ValueError('紧凑结果快照仍超过256MB，请减少发布窗口；上一份快照继续保留')
-        payload = gzip.compress(raw, compresslevel=6, mtime=0)
+        payload, chunks = compress_chunks(raw)
         del raw
         if len(payload) > MAX_COMPRESSED:
             raise ValueError('结果快照压缩后超过64MB；上一份快照继续保留')
-        return self.publish_bytes(payload, data)
+        with self.lock:
+            return self._publish_bytes(payload, data, chunks)
 
     def publish_bytes(self, payload, data):
         with self.lock:
@@ -268,7 +280,7 @@ class SnapshotFiles:
                 raise FileNotFoundError('尚未生成快照')
             return latest, (self.folder/latest['filename']).open('rb')
 
-    def _publish_bytes(self, payload, data):
+    def _publish_bytes(self, payload, data, chunks=None):
         validate_snapshot(data)
         digest = hashlib.sha256(payload).hexdigest()
         previous = self.manifest()
@@ -298,6 +310,8 @@ class SnapshotFiles:
                         "bytes": len(payload), "snapshot_id": data["snapshot_id"],
                         "created_at": data["created_at"], "data_version": data["data_version"],
                         "parameter_version": data["parameter_version"], **publication_metadata(data)}
+            if chunks:
+                manifest['chunks'] = chunks
             self._write_json(self._metadata_path(data['snapshot_id']), manifest)
             with manifest_tmp.open("wb") as f:
                 f.write(encode_json(manifest))
